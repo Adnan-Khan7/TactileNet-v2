@@ -1,0 +1,450 @@
+"""
+tactile_pipeline_updated.py
+
+Updated tactile generation pipeline.
+
+Mode behaviors (final):
+ - mode=1: Use ChatGPT (M1) to refine prompt, load adapter (M3), generate 4 images with SD v1.5 (M2).
+ - mode=2: Use ChatGPT image API only (M1 generates the image directly, no SD/LoRA used).
+ - mode=3: Use ChatGPT to refine prompt, apply class-specific adapter (M3) on top of three different SD base models and generate images.
+
+Notes:
+ - Set environment variables OPENAI_API_KEY and HF_TOKEN as needed.
+ - Place adapters named like: tactile_<class_name>.safetensors in ADAPTERS_DIR.
+
+This file is a drop-in updated version of your previously provided script.
+"""
+
+import os
+import json
+import logging
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import base64
+from io import BytesIO
+
+import torch
+from PIL import Image
+import numpy as np
+
+# OpenAI new-style client
+from openai import OpenAI
+import openai as openai_legacy  # kept if other parts of the code expect openai
+
+# Hugging Face / Diffusers / Transformers
+from transformers import CLIPProcessor, CLIPModel
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from safetensors.torch import load_file as safetensors_load
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tactile_pipeline")
+
+# ==============
+# Global config
+# ==============
+CLASS_NAMES = [
+    # Fill your 66 class names here (examples provided)
+    "cat", "dog", "airplane", "car", "bicycle", "chair",
+    # ... add remaining class names ...
+]
+
+ADAPTERS_DIR = Path("./adapters")
+DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+BASE_MODELS_FOR_MODE3 = [
+    "runwayml/stable-diffusion-v1-5",
+    "Linaqruf/anything-v3.0",
+    "CompVis/stable-diffusion-v1-4",
+]
+
+PROMPT_TEMPLATE = (
+    "Create a tactile graphic of an {object}, specifically designed for individuals "
+    "with visual impairments. The graphic should feature raised, smooth lines to delineate the {patterns}, "
+    "against a simplistic background"
+)
+
+SEEDS = [42, 1234, 2025, 9999]
+HEIGHT = 512
+WIDTH = 512
+NUM_INFERENCE_STEPS = 30
+GUIDANCE_SCALE = 7.5
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+HF_TOKEN = os.environ.get("HF_TOKEN", None)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", None)
+
+# Create OpenAI client if key provided
+client: Optional[OpenAI] = None
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    # also set legacy openai module key for backward compat if used elsewhere
+    try:
+        openai_legacy.api_key = OPENAI_API_KEY
+    except Exception:
+        pass
+else:
+    logger.warning("OPENAI_API_KEY not set. Mode 2 (ChatGPT image generation) will fail without it.")
+
+# CLIP
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+
+# ==============
+# Utilities
+# ==============
+
+def ensure_dir(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+def load_image(path: str, size: Optional[int] = None) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    if size:
+        img = img.resize((size, size), Image.Resampling.LANCZOS)
+    return img
+
+
+# ==========================
+# Class detection (CLIP)
+# ==========================
+class ClassDetectorCLIP:
+    def __init__(self, device: str = DEVICE, model_name: str = CLIP_MODEL_NAME):
+        logger.info("Loading CLIP model for class detection...")
+        self.device = device
+        self.model = CLIPModel.from_pretrained(model_name).to(device)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+
+    def detect_class(self, image_path: str, candidate_classes: List[str], threshold: float = 0.15) -> Tuple[Optional[str], float]:
+        image = load_image(image_path, size=224)
+        inputs = self.processor(text=candidate_classes, images=image, return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            img_emb = self.model.get_image_features(**{k: v for k, v in inputs.items() if k.startswith("pixel")})
+            txt_emb = self.model.get_text_features(inputs["input_ids"], attention_mask=inputs["attention_mask"]) 
+
+        img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
+        txt_emb = txt_emb / txt_emb.norm(p=2, dim=-1, keepdim=True)
+
+        sims = (txt_emb @ img_emb.T).squeeze().cpu().numpy()
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+        best_class = candidate_classes[best_idx]
+        logger.info(f"CLIP best class: {best_class} (sim={best_sim:.4f})")
+        if best_sim < threshold:
+            return None, best_sim
+        return best_class, best_sim
+
+
+# ==========================
+# ChatGPT prompt refinement
+# ==========================
+def refine_prompt_with_chatgpt(class_name: str, image_path: str, template: str, mode2_designer: bool = False) -> str:
+    if not client:
+        logger.warning("OpenAI client not available. Falling back to template-only prompt.")
+        patterns = "major contours and prominent features"
+        return template.format(object=class_name, patterns=patterns)
+
+    system_msg = "You are a helpful assistant that inspects an image and produces short bullet features describing the main tactile-relevant features."
+    if mode2_designer:
+        system_msg = (
+            "You are an expert tactile designer. Take your time to apply tactile designing principles (e.g., BANA) "
+            "and produce a refined prompt for a tactile graphic. Output must be a single sentence (no code) suitable for an image-generation prompt."
+        )
+
+    prompt_for_model = (
+        f"Image: {Path(image_path).name}\n"
+        f"Class identified: {class_name}\n"
+        "Describe the primary tactile features to include (2-5 features), short phrases only.\n"
+        "Examples: 'whiskers', 'rounded ears', 'long tail', 'paw pads', 'beak', 'wings'.\n"
+        "Return only a comma-separated list of the features.\n"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt_for_model},
+            ],
+            max_tokens=200,
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content.strip()
+        features = content.splitlines()[0]
+        features = features.replace(" and ", ",").strip()
+        final_prompt = template.format(object=class_name, patterns=features)
+        logger.info(f"Refined prompt from ChatGPT: {final_prompt}")
+        return final_prompt
+    except Exception as e:
+        logger.warning(f"OpenAI call failed: {e}. Falling back to template-only prompt.")
+        patterns = "major contours and prominent features"
+        return template.format(object=class_name, patterns=patterns)
+
+
+# ==========================
+# LoRA injector (heuristic)
+# ==========================
+def inject_lora_from_safetensors(pipeline: StableDiffusionPipeline, lora_path: str, multiplier: float = 1.0) -> bool:
+    try:
+        data = safetensors_load(lora_path)
+    except Exception as e:
+        logger.error(f"Failed to load safetensors file {lora_path}: {e}")
+        return False
+
+    def add_to_module(module: torch.nn.Module, target_name: str, delta: torch.Tensor):
+        sd = module.state_dict()
+        candidates = [k for k in sd.keys() if k.endswith(target_name)]
+        if not candidates:
+            return False
+        key = candidates[0]
+        param = sd[key]
+        if param.shape == delta.shape:
+            sd[key].add_(delta.to(param.device) * multiplier)
+            module.load_state_dict(sd)
+            return True
+        else:
+            if param.ndim == 2 and delta.ndim == 2 and param.shape == delta.T.shape:
+                sd[key].add_(delta.T.to(param.device) * multiplier)
+                module.load_state_dict(sd)
+                return True
+        return False
+
+    unet = pipeline.unet
+    text_encoder = getattr(pipeline, "text_encoder", None)
+    applied_any = False
+
+    for k, v in data.items():
+        key_lower = k.lower()
+        tensor = v.clone().detach()
+        if "lora_unet" in key_lower or "unet" in key_lower:
+            last_part = k.split(".")[-1]
+            success = add_to_module(unet, last_part, tensor)
+            if not success:
+                sub = ".".join(k.split(".")[-2:])
+                success = add_to_module(unet, sub, tensor)
+            if success:
+                applied_any = True
+        elif ("lora_te" in key_lower) or ("text" in key_lower and ("lora" in key_lower or "te" in key_lower)):
+            if text_encoder is None:
+                continue
+            last_part = k.split(".")[-1]
+            success = add_to_module(text_encoder, last_part, tensor)
+            if success:
+                applied_any = True
+        else:
+            last_part = k.split(".")[-1]
+            if add_to_module(unet, last_part, tensor):
+                applied_any = True
+            elif text_encoder and add_to_module(text_encoder, last_part, tensor):
+                applied_any = True
+
+    if not applied_any:
+        logger.warning("No LoRA parameters appeared to be applied. The safetensors keys might use an unexpected naming scheme.")
+        return False
+
+    logger.info(f"Injected LoRA weights from {lora_path} with multiplier={multiplier}.")
+    return True
+
+
+# ==========================
+# Stable Diffusion loader + generator
+# ==========================
+def load_sd_pipeline(model_id: str, device: str = DEVICE, use_auth_token: Optional[str] = HF_TOKEN) -> StableDiffusionPipeline:
+    logger.info(f"Loading SD pipeline for {model_id}...")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+        use_auth_token=use_auth_token,
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe = pipe.to(device)
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
+    return pipe
+
+
+def generate_and_save_images(pipeline: StableDiffusionPipeline, prompt: str, seeds: List[int], outdir: Path, basename: str):
+    ensure_dir(outdir)
+    results = []
+    for s in seeds:
+        generator = torch.Generator(device=DEVICE).manual_seed(s)
+        logger.info(f"Generating image for seed {s} ...")
+        with torch.autocast(DEVICE if DEVICE.startswith("cuda") else "cpu"):
+            image = pipeline(
+                prompt,
+                height=HEIGHT,
+                width=WIDTH,
+                num_inference_steps=NUM_INFERENCE_STEPS,
+                guidance_scale=GUIDANCE_SCALE,
+                generator=generator,
+            ).images[0]
+        fname = outdir / f"{basename}_seed{s}.png"
+        image.save(fname)
+        logger.info(f"Saved {fname}")
+        results.append(str(fname))
+    return results
+
+
+# ==========================
+# Main runner
+# ==========================
+def run_pipeline(
+    image_path: str,
+    mode: int = 1,
+    class_list: List[str] = CLASS_NAMES,
+    adapters_dir: Path = ADAPTERS_DIR,
+    base_model: str = DEFAULT_BASE_MODEL,
+    base_models_for_mode3: List[str] = BASE_MODELS_FOR_MODE3,
+    out_root: Path = Path("./outputs"),
+):
+    ensure_dir(out_root)
+    detector = ClassDetectorCLIP(device=DEVICE)
+    class_name, sim = detector.detect_class(image_path, class_list)
+    if class_name is None:
+        logger.error("User class un-identified (below similarity threshold). Quitting.")
+        return
+
+    mode2_designer = (mode == 2)
+    refined_prompt = refine_prompt_with_chatgpt(class_name, image_path, PROMPT_TEMPLATE, mode2_designer=mode2_designer)
+
+    # For modes that require an adapter (1 and 3), check adapter availability.
+    adapter_filename = adapters_dir / f"tactile_{class_name}.safetensors"
+    if mode in (1, 3) and not adapter_filename.exists():
+        logger.error(f"Adapter for class {class_name} not found at {adapter_filename}. Quitting.")
+        return
+
+    outdir = out_root / f"{Path(image_path).stem}_{class_name}_mode{mode}"
+    ensure_dir(outdir)
+
+    # Mode 1: Stable Diffusion + adapter (LoRA)
+    if mode == 1:
+        pipe = load_sd_pipeline(base_model, device=DEVICE)
+        ok = inject_lora_from_safetensors(pipe, str(adapter_filename), multiplier=1.0)
+        if not ok:
+            logger.warning("Adapter injection may have failed. Proceeding anyway (adapter not applied).")
+        generated = generate_and_save_images(pipe, refined_prompt, SEEDS, outdir, basename=f"{class_name}_mode1")
+        logger.info("Generated images: " + ", ".join(generated))
+        return generated
+
+    # Mode 2: ChatGPT image generation only (no SD/adapter)
+    elif mode == 2:
+        if not client:
+            logger.error("OpenAI client not configured (OPENAI_API_KEY missing). Cannot run mode 2.")
+            return []
+
+        # Compose tactile-design prompt
+        prompt = (
+            f"Convert this natural image into a tactile graphic for individuals with visual impairments. "
+            f"Follow tactile design principles (e.g., BANA). "
+            f"Focus on raised, smooth lines to delineate key features. "
+            f"Class: {class_name}. "
+            f"Prompt template: {PROMPT_TEMPLATE}. "
+            f"Refined prompt: {refined_prompt}"
+        )
+
+        # Compatible sizes supported by the OpenAI image endpoint
+        SUPPORTED_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+        requested_size = f"{WIDTH}x{HEIGHT}"
+
+        # Map unsupported sizes to a sensible default: prefer same-aspect 1024x1024 for square requests,
+        # otherwise fall back to 'auto' which lets the model decide.
+        if requested_size in SUPPORTED_IMAGE_SIZES:
+            size_arg = requested_size
+        else:
+            if WIDTH == HEIGHT:
+                size_arg = "1024x1024"
+            else:
+                size_arg = "auto"
+            logger.info(f"Requested size {requested_size} not supported by API; using {size_arg} instead.")
+
+        try:
+            # NOTE: do not pass `response_format` parameter (not supported by all clients).
+            resp = client.images.generate(
+                model="gpt-image-1",
+                prompt=prompt,
+                size=size_arg,
+                n=1,
+            )
+
+            # --- robustly extract returned image data ---
+            if isinstance(resp, dict):
+                item = resp["data"][0]
+            else:
+                item = resp.data[0]
+
+            b64_image = None
+            img_url = None
+            if isinstance(item, dict):
+                b64_image = item.get("b64_json") or item.get("b64")
+                img_url = item.get("url")
+            else:
+                b64_image = getattr(item, "b64_json", None) or getattr(item, "b64", None)
+                img_url = getattr(item, "url", None)
+
+            if b64_image:
+                img_data = base64.b64decode(b64_image)
+                img = Image.open(BytesIO(img_data)).convert("RGB")
+            elif img_url:
+                import httpx
+                r = httpx.get(img_url, follow_redirects=True, timeout=30.0)
+                r.raise_for_status()
+                img = Image.open(BytesIO(r.content)).convert("RGB")
+            else:
+                raise RuntimeError("Image response did not contain 'b64_json' or 'url' fields. Response: " + str(resp))
+
+            # If we requested '1024x1024' but want to save at user WIDTHxHEIGHT, resize down (keeps quality)
+            if size_arg == "1024x1024" and (WIDTH != 1024 or HEIGHT != 1024):
+                logger.info(f"Resizing generated image from 1024x1024 to {WIDTH}x{HEIGHT} for consistency with pipeline settings.")
+                img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+            out_file = outdir / f"{class_name}_mode2_chatgpt.png"
+            img.save(out_file)
+            logger.info(f"Saved ChatGPT-generated tactile image to {out_file}")
+            return [str(out_file)]
+
+        except Exception as e:
+            logger.error(f"ChatGPT image generation failed: {e}")
+            return []
+
+    # Mode 3: Apply adapter on multiple base models
+    elif mode == 3:
+        all_results = {}
+        for model_id in base_models_for_mode3:
+            try:
+                pipe = load_sd_pipeline(model_id, device=DEVICE)
+            except Exception as e:
+                logger.error(f"Failed to load base model {model_id}: {e}")
+                continue
+            ok = inject_lora_from_safetensors(pipe, str(adapter_filename), multiplier=1.0)
+            if not ok:
+                logger.warning(f"Adapter injection for model {model_id} may have failed.")
+            model_outdir = outdir / Path(model_id.replace("/", "_"))
+            ensure_dir(model_outdir)
+            generated = generate_and_save_images(pipe, refined_prompt, SEEDS, model_outdir, basename=f"{class_name}_{Path(model_id).name}_mode3")
+            all_results[model_id] = generated
+        logger.info(f"Mode 3 generation complete. Results: {json.dumps(all_results, indent=2)}")
+        return all_results
+
+    else:
+        logger.error("Unsupported mode. Choose 1, 2, or 3.")
+        return
+
+
+# ==========================
+# CLI
+# ==========================
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Tactile generation pipeline driver")
+    parser.add_argument("--image", required=True, help="Path to natural image")
+    parser.add_argument("--mode", type=int, default=1, choices=[1, 2, 3], help="Mode (1/2/3)")
+    parser.add_argument("--adapters", default=str(ADAPTERS_DIR), help="Path to adapters directory")
+    parser.add_argument("--base_model", default=DEFAULT_BASE_MODEL, help="Base SD model id (for mode 1/2)")
+    parser.add_argument("--out", default="./outputs", help="Output directory")
+    args = parser.parse_args()
+
+    ADAPTERS_DIR = Path(args.adapters)
+    run_pipeline(args.image, mode=args.mode, adapters_dir=ADAPTERS_DIR, base_model=args.base_model, out_root=Path(args.out))
