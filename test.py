@@ -1,9 +1,6 @@
 """
-tactile_pipeline_updated.py
-
-Updated tactile generation pipeline.
-
-Mode behaviors (final):
+tactile_pipeline.py
+Mode behaviors:
  - mode=1: Use ChatGPT (M1) to refine prompt, load adapter (M3), generate 4 images with SD v1.5 (M2).
  - mode=2: Use ChatGPT image API only (M1 generates the image directly, no SD/LoRA used).
  - mode=3: Use ChatGPT to refine prompt, apply class-specific adapter (M3) on top of three different SD base models and generate images.
@@ -11,12 +8,10 @@ Mode behaviors (final):
 Notes:
  - Set environment variables OPENAI_API_KEY and HF_TOKEN as needed.
  - Place adapters named like: tactile_<class_name>.safetensors in ADAPTERS_DIR.
-
-This file is a drop-in updated version of your previously provided script.
 """
-
-
+# imports
 import json
+import math
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -27,16 +22,25 @@ from PIL import Image
 import numpy as np
 import os
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
-# OpenAI new-style client
 from openai import OpenAI
 import openai as openai_legacy 
-# Hugging Face / Diffusers / Transformers
 from transformers import CLIPProcessor, CLIPModel
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from safetensors.torch import load_file as safetensors_load
+from compel import Compel, ReturnedEmbeddingsType
 
+
+# more imports
+from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionImg2ImgPipeline,
+    DPMSolverMultistepScheduler,
+)
+from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
+
+# logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tactile_pipeline")
+logger.info("Hello to TactileNet platform!")
 
 # ==============
 # Global config
@@ -45,23 +49,51 @@ CLASS_NAMES = [
     # we have total = 66 classes, but for brevity, we will use a subset here.
     "cat", "dog", "airplane", "car", "bicycle", "chair",
 ]
-# Add near top of file (global config section)
+
+# Img2Img controls
+DEFAULT_DENOISING_STRENGTH = 0.9   # lower = stick closer to source image
+NEGATIVE_PROMPT = ""                # set if you want (e.g., "blurry, low quality")
+USE_IMG2IMG_FOR_MODE1 = True        # because we're relying on a natural image
+
+SKIP_SAFETY_CHECK = True  
+
 HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
-
-
 ADAPTERS_DIR = Path("./adapters")
-DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+# DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5" # v1.5 SD
+DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/adapters/deliberate_v3.safetensors" # the chosen base model of TactileNet pipeline, also based on V1.5
+
+# mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
     "runwayml/stable-diffusion-v1-5",
     "Linaqruf/anything-v3.0",
     "CompVis/stable-diffusion-v1-4",
 ]
+# Prompt template for ChatGPT refinement
+# This template is used to generate a prompt for tactile graphics based on the identified class.
+# It includes the object type and patterns to be highlighted in the tactile graphic.
 
 PROMPT_TEMPLATE = (
     "Create a tactile graphic of an {object}, specifically designed for individuals "
     "with visual impairments. The graphic should feature raised, smooth lines to delineate the {patterns}, "
     "against a simplistic background"
 )
+
+try:
+    CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+except Exception as e:
+    logger.error(f"Failed to load CLIP tokenizer: {e}")
+    CLIP_TOKENIZER = None
+
+def truncate_prompt(prompt, max_length=77):
+    if CLIP_TOKENIZER is None:
+        return prompt  # fallback if tokenizer not available
+    tokens = CLIP_TOKENIZER.tokenize(prompt)
+    if len(tokens) > max_length:
+        tokens = tokens[:max_length]
+        truncated_prompt = CLIP_TOKENIZER.convert_tokens_to_string(tokens)
+        logger.warning(f"Prompt truncated to {max_length} tokens. Original length: {len(tokens)}")
+        return truncated_prompt
+    return prompt
 
 SEEDS = [42, 1234, 2025, 9999]
 HEIGHT = 512
@@ -85,7 +117,7 @@ else:
     logger.warning("OPENAI_API_KEY not set. Mode 2 (ChatGPT image generation) will fail without it.")
 
 # CLIP
-CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32" # used for class detection
 
 # ==============
 # Utilities
@@ -107,7 +139,7 @@ def load_image(path: str, size: Optional[int] = None) -> Image.Image:
 # ==========================
 class ClassDetectorCLIP:
     def __init__(self, device: str = DEVICE, model_name: str = CLIP_MODEL_NAME):
-        logger.info("Loading CLIP model for class detection...")
+        logger.info("Loading CLIP model for class detection.")
         self.device = device
         self.model = CLIPModel.from_pretrained(model_name).to(device)
         self.processor = CLIPProcessor.from_pretrained(model_name)
@@ -126,6 +158,7 @@ class ClassDetectorCLIP:
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         best_class = candidate_classes[best_idx]
+        logger.info("Class identification results:")
         logger.info(f"CLIP best class: {best_class} (sim={best_sim:.4f})")
         if best_sim < threshold:
             return None, best_sim
@@ -177,124 +210,112 @@ def refine_prompt_with_chatgpt(class_name: str, image_path: str, template: str, 
         patterns = "major contours and prominent features"
         return template.format(object=class_name, patterns=patterns)
 
-
-# # ==========================
-# # LoRA injector (heuristic)
-# # ==========================
-# def inject_lora_from_safetensors(pipeline: StableDiffusionPipeline, lora_path: str, multiplier: float = 1.0) -> bool:
-#     try:
-#         data = safetensors_load(lora_path)
-#     except Exception as e:
-#         logger.error(f"Failed to load safetensors file {lora_path}: {e}")
-#         return False
-
-#     def add_to_module(module: torch.nn.Module, target_name: str, delta: torch.Tensor):
-#         sd = module.state_dict()
-#         candidates = [k for k in sd.keys() if k.endswith(target_name)]
-#         if not candidates:
-#             return False
-#         key = candidates[0]
-#         param = sd[key]
-#         if param.shape == delta.shape:
-#             sd[key].add_(delta.to(param.device) * multiplier)
-#             module.load_state_dict(sd)
-#             return True
-#         else:
-#             if param.ndim == 2 and delta.ndim == 2 and param.shape == delta.T.shape:
-#                 sd[key].add_(delta.T.to(param.device) * multiplier)
-#                 module.load_state_dict(sd)
-#                 return True
-#         return False
-
-#     unet = pipeline.unet
-#     text_encoder = getattr(pipeline, "text_encoder", None)
-#     applied_any = False
-
-#     for k, v in data.items():
-#         key_lower = k.lower()
-#         tensor = v.clone().detach()
-#         if "lora_unet" in key_lower or "unet" in key_lower:
-#             last_part = k.split(".")[-1]
-#             success = add_to_module(unet, last_part, tensor)
-#             if not success:
-#                 sub = ".".join(k.split(".")[-2:])
-#                 success = add_to_module(unet, sub, tensor)
-#             if success:
-#                 applied_any = True
-#         elif ("lora_te" in key_lower) or ("text" in key_lower and ("lora" in key_lower or "te" in key_lower)):
-#             if text_encoder is None:
-#                 continue
-#             last_part = k.split(".")[-1]
-#             success = add_to_module(text_encoder, last_part, tensor)
-#             if success:
-#                 applied_any = True
-#         else:
-#             last_part = k.split(".")[-1]
-#             if add_to_module(unet, last_part, tensor):
-#                 applied_any = True
-#             elif text_encoder and add_to_module(text_encoder, last_part, tensor):
-#                 applied_any = True
-
-#     if not applied_any:
-#         logger.warning("No LoRA parameters appeared to be applied. The safetensors keys might use an unexpected naming scheme.")
-#         return False
-
-#     logger.info(f"Injected LoRA weights from {lora_path} with multiplier={multiplier}.")
-#     return True
-
-
 # ==========================
 # Stable Diffusion loader + generator
 # ==========================
-def load_sd_pipeline(model_ref, device="cuda"):
-    """
-    Load Stable Diffusion pipeline from:
-    - Hugging Face model ID
-    - Local .ckpt / .safetensors checkpoint (v1 or v2 auto-detect)
-    """
-    if os.path.isfile(model_ref) and model_ref.endswith((".ckpt", ".safetensors")):
-        print(f"[INFO] Loading local checkpoint: {model_ref}")
-
-        # Simple heuristic to detect version
-        filename = os.path.basename(model_ref).lower()
-        if any(x in filename for x in ["v2", "2.0", "2"]):
-            config_file = "v2-inference.yaml"
-        else:
-            config_file = "v1-inference.yaml"
-
-        pipe = download_from_original_stable_diffusion_ckpt(
-            checkpoint_path=model_ref,
-            original_config_file=config_file,
-            from_safetensors=model_ref.endswith(".safetensors"),
-        )
-    else:
-        print(f"[INFO] Loading Hugging Face model: {model_ref}")
-        pipe = StableDiffusionPipeline.from_pretrained(model_ref)
-
+def load_sd_pipeline(
+    model_id: str,
+    device: str = DEVICE,
+    use_auth_token: Optional[str] = HF_TOKEN,
+    img2img: bool = False,
+):
+    logger.info(f"Loading SD {'img2img' if img2img else 'txt2img'} pipeline for {model_id}...")
+    PipeClass = StableDiffusionImg2ImgPipeline if img2img else StableDiffusionPipeline
+    pipe = PipeClass.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+        token=use_auth_token,
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
     return pipe
 
 
-def generate_and_save_images(pipeline: StableDiffusionPipeline, prompt: str, seeds: List[int], outdir: Path, basename: str):
+
+
+def generate_and_save_images(
+    pipeline,
+    prompt: str,
+    seeds: List[int],
+    outdir: Path,
+    basename: str,
+    init_image_path: Optional[str] = None,
+    denoising_strength: Optional[float] = None,
+    negative_prompt: Optional[str] = None,
+):
     ensure_dir(outdir)
     results = []
+
+    # Use the pipeline's tokenizer to properly truncate the prompt
+    def truncate_prompt_for_pipeline(text, pipeline):
+        if text is None:
+            return None
+        # Tokenize with the pipeline's tokenizer
+        tokens = pipeline.tokenizer(
+            text,
+            padding="do_not_pad",
+            truncation=False,
+            return_tensors="pt",
+        ).input_ids[0]
+        
+        if len(tokens) > pipeline.tokenizer.model_max_length:
+            # Truncate to the model's max length
+            tokens = tokens[:pipeline.tokenizer.model_max_length]
+            truncated_text = pipeline.tokenizer.decode(tokens, skip_special_tokens=True)
+            logger.warning(f"Prompt truncated to {pipeline.tokenizer.model_max_length} tokens. Original length: {len(tokens)}")
+            return truncated_text
+        return text
+
+    # Truncate both prompt and negative prompt
+    truncated_prompt = truncate_prompt_for_pipeline(prompt, pipeline)
+    truncated_negative_prompt = truncate_prompt_for_pipeline(negative_prompt, pipeline)
+
+    # Prepare init image if provided (img2img)
+    init_img = None
+    if init_image_path is not None:
+        init_img = load_image(init_image_path)
+        init_img = init_img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
     for s in seeds:
         generator = torch.Generator(device=DEVICE).manual_seed(s)
         logger.info(f"Generating image for seed {s} ...")
         with torch.autocast(DEVICE if DEVICE.startswith("cuda") else "cpu"):
-            image = pipeline(
-                prompt,
-                height=HEIGHT,
-                width=WIDTH,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                guidance_scale=GUIDANCE_SCALE,
-                generator=generator,
-            ).images[0]
+            if init_img is not None and isinstance(pipeline, StableDiffusionImg2ImgPipeline):
+                image = pipeline(
+                    prompt=truncated_prompt,
+                    image=init_img,
+                    strength=denoising_strength if denoising_strength is not None else DEFAULT_DENOISING_STRENGTH,
+                    height=HEIGHT,
+                    width=WIDTH,
+                    num_inference_steps=NUM_INFERENCE_STEPS,
+                    guidance_scale=GUIDANCE_SCALE,
+                    negative_prompt=truncated_negative_prompt,
+                    generator=generator,
+                ).images[0]
+            else:
+                image = pipeline(
+                    truncated_prompt,
+                    height=HEIGHT,
+                    width=WIDTH,
+                    num_inference_steps=NUM_INFERENCE_STEPS,
+                    guidance_scale=GUIDANCE_SCALE,
+                    negative_prompt=truncated_negative_prompt,
+                    generator=generator,
+                ).images[0]
+
         fname = outdir / f"{basename}_seed{s}.png"
         image.save(fname)
         logger.info(f"Saved {fname}")
         results.append(str(fname))
     return results
+
 
 
 # ==========================
@@ -329,31 +350,40 @@ def run_pipeline(
     ensure_dir(outdir)
 
     # Mode 1: Stable Diffusion + adapter (LoRA)
-    # Mode 1: Stable Diffusion + adapter (LoRA)
     if mode == 1:
-        # 1. Load the base SD pipeline first
-        try:
-            pipe = load_sd_pipeline(base_model, device=DEVICE)
-        except Exception as e:
-            logger.error(f"Failed to load base model {base_model}: {e}")
-            return
-
-        # 2. Load the LoRA adapter
+        # Use img2img so we can set denoising strength (we rely on the natural image)
+        pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
         try:
             pipe.load_lora_weights(str(adapter_filename))
             logger.info(f"Loaded LoRA adapter from {adapter_filename}")
         except Exception as e:
             logger.error(f"Failed to load LoRA adapter {adapter_filename}: {e}")
 
-        # 3. Generate with refined + baseline prompts
-        generated = generate_and_save_images(pipe, refined_prompt, SEEDS, outdir, basename=f"{class_name}_mode1")
+        generated = generate_and_save_images(
+            pipe,
+            refined_prompt,
+            SEEDS,
+            outdir,
+            basename=f"{class_name}_mode1",
+            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
+            denoising_strength=DEFAULT_DENOISING_STRENGTH,
+            negative_prompt=NEGATIVE_PROMPT,
+        )
         logger.info("Generated images (refined prompt): " + ", ".join(generated))
 
-        baseline = generate_and_save_images(pipe, HARDCODED_PROMPT, [SEEDS[0]], outdir, basename=f"{class_name}_mode1_baseline")
+        baseline = generate_and_save_images(
+            pipe,
+            HARDCODED_PROMPT,
+            [SEEDS[0]],
+            outdir,
+            basename=f"{class_name}_mode1_baseline",
+            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
+            denoising_strength=DEFAULT_DENOISING_STRENGTH,
+            negative_prompt=NEGATIVE_PROMPT,
+        )
         logger.info("Generated baseline (hardcoded prompt): " + ", ".join(baseline))
 
         return generated + baseline
-
 
     # Mode 2: ChatGPT image generation only (no SD/adapter)
     elif mode == 2:
