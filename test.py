@@ -15,23 +15,21 @@ Notes:
 This file is a drop-in updated version of your previously provided script.
 """
 
-import os
+
 import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
-
 import base64
 from io import BytesIO
-
 import torch
 from PIL import Image
 import numpy as np
-
+import os
+from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
 # OpenAI new-style client
 from openai import OpenAI
-import openai as openai_legacy  # kept if other parts of the code expect openai
-
+import openai as openai_legacy 
 # Hugging Face / Diffusers / Transformers
 from transformers import CLIPProcessor, CLIPModel
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
@@ -44,10 +42,12 @@ logger = logging.getLogger("tactile_pipeline")
 # Global config
 # ==============
 CLASS_NAMES = [
-    # Fill your 66 class names here (examples provided)
+    # we have total = 66 classes, but for brevity, we will use a subset here.
     "cat", "dog", "airplane", "car", "bicycle", "chair",
-    # ... add remaining class names ...
 ]
+# Add near top of file (global config section)
+HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
+
 
 ADAPTERS_DIR = Path("./adapters")
 DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5"
@@ -178,90 +178,100 @@ def refine_prompt_with_chatgpt(class_name: str, image_path: str, template: str, 
         return template.format(object=class_name, patterns=patterns)
 
 
-# ==========================
-# LoRA injector (heuristic)
-# ==========================
-def inject_lora_from_safetensors(pipeline: StableDiffusionPipeline, lora_path: str, multiplier: float = 1.0) -> bool:
-    try:
-        data = safetensors_load(lora_path)
-    except Exception as e:
-        logger.error(f"Failed to load safetensors file {lora_path}: {e}")
-        return False
+# # ==========================
+# # LoRA injector (heuristic)
+# # ==========================
+# def inject_lora_from_safetensors(pipeline: StableDiffusionPipeline, lora_path: str, multiplier: float = 1.0) -> bool:
+#     try:
+#         data = safetensors_load(lora_path)
+#     except Exception as e:
+#         logger.error(f"Failed to load safetensors file {lora_path}: {e}")
+#         return False
 
-    def add_to_module(module: torch.nn.Module, target_name: str, delta: torch.Tensor):
-        sd = module.state_dict()
-        candidates = [k for k in sd.keys() if k.endswith(target_name)]
-        if not candidates:
-            return False
-        key = candidates[0]
-        param = sd[key]
-        if param.shape == delta.shape:
-            sd[key].add_(delta.to(param.device) * multiplier)
-            module.load_state_dict(sd)
-            return True
-        else:
-            if param.ndim == 2 and delta.ndim == 2 and param.shape == delta.T.shape:
-                sd[key].add_(delta.T.to(param.device) * multiplier)
-                module.load_state_dict(sd)
-                return True
-        return False
+#     def add_to_module(module: torch.nn.Module, target_name: str, delta: torch.Tensor):
+#         sd = module.state_dict()
+#         candidates = [k for k in sd.keys() if k.endswith(target_name)]
+#         if not candidates:
+#             return False
+#         key = candidates[0]
+#         param = sd[key]
+#         if param.shape == delta.shape:
+#             sd[key].add_(delta.to(param.device) * multiplier)
+#             module.load_state_dict(sd)
+#             return True
+#         else:
+#             if param.ndim == 2 and delta.ndim == 2 and param.shape == delta.T.shape:
+#                 sd[key].add_(delta.T.to(param.device) * multiplier)
+#                 module.load_state_dict(sd)
+#                 return True
+#         return False
 
-    unet = pipeline.unet
-    text_encoder = getattr(pipeline, "text_encoder", None)
-    applied_any = False
+#     unet = pipeline.unet
+#     text_encoder = getattr(pipeline, "text_encoder", None)
+#     applied_any = False
 
-    for k, v in data.items():
-        key_lower = k.lower()
-        tensor = v.clone().detach()
-        if "lora_unet" in key_lower or "unet" in key_lower:
-            last_part = k.split(".")[-1]
-            success = add_to_module(unet, last_part, tensor)
-            if not success:
-                sub = ".".join(k.split(".")[-2:])
-                success = add_to_module(unet, sub, tensor)
-            if success:
-                applied_any = True
-        elif ("lora_te" in key_lower) or ("text" in key_lower and ("lora" in key_lower or "te" in key_lower)):
-            if text_encoder is None:
-                continue
-            last_part = k.split(".")[-1]
-            success = add_to_module(text_encoder, last_part, tensor)
-            if success:
-                applied_any = True
-        else:
-            last_part = k.split(".")[-1]
-            if add_to_module(unet, last_part, tensor):
-                applied_any = True
-            elif text_encoder and add_to_module(text_encoder, last_part, tensor):
-                applied_any = True
+#     for k, v in data.items():
+#         key_lower = k.lower()
+#         tensor = v.clone().detach()
+#         if "lora_unet" in key_lower or "unet" in key_lower:
+#             last_part = k.split(".")[-1]
+#             success = add_to_module(unet, last_part, tensor)
+#             if not success:
+#                 sub = ".".join(k.split(".")[-2:])
+#                 success = add_to_module(unet, sub, tensor)
+#             if success:
+#                 applied_any = True
+#         elif ("lora_te" in key_lower) or ("text" in key_lower and ("lora" in key_lower or "te" in key_lower)):
+#             if text_encoder is None:
+#                 continue
+#             last_part = k.split(".")[-1]
+#             success = add_to_module(text_encoder, last_part, tensor)
+#             if success:
+#                 applied_any = True
+#         else:
+#             last_part = k.split(".")[-1]
+#             if add_to_module(unet, last_part, tensor):
+#                 applied_any = True
+#             elif text_encoder and add_to_module(text_encoder, last_part, tensor):
+#                 applied_any = True
 
-    if not applied_any:
-        logger.warning("No LoRA parameters appeared to be applied. The safetensors keys might use an unexpected naming scheme.")
-        return False
+#     if not applied_any:
+#         logger.warning("No LoRA parameters appeared to be applied. The safetensors keys might use an unexpected naming scheme.")
+#         return False
 
-    logger.info(f"Injected LoRA weights from {lora_path} with multiplier={multiplier}.")
-    return True
+#     logger.info(f"Injected LoRA weights from {lora_path} with multiplier={multiplier}.")
+#     return True
 
 
 # ==========================
 # Stable Diffusion loader + generator
 # ==========================
-def load_sd_pipeline(model_id: str, device: str = DEVICE, use_auth_token: Optional[str] = HF_TOKEN) -> StableDiffusionPipeline:
-    logger.info(f"Loading SD pipeline for {model_id}...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
-        use_auth_token=use_auth_token,
-    )
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+def load_sd_pipeline(model_ref, device="cuda"):
+    """
+    Load Stable Diffusion pipeline from:
+    - Hugging Face model ID
+    - Local .ckpt / .safetensors checkpoint (v1 or v2 auto-detect)
+    """
+    if os.path.isfile(model_ref) and model_ref.endswith((".ckpt", ".safetensors")):
+        print(f"[INFO] Loading local checkpoint: {model_ref}")
+
+        # Simple heuristic to detect version
+        filename = os.path.basename(model_ref).lower()
+        if any(x in filename for x in ["v2", "2.0", "2"]):
+            config_file = "v2-inference.yaml"
+        else:
+            config_file = "v1-inference.yaml"
+
+        pipe = download_from_original_stable_diffusion_ckpt(
+            checkpoint_path=model_ref,
+            original_config_file=config_file,
+            from_safetensors=model_ref.endswith(".safetensors"),
+        )
+    else:
+        print(f"[INFO] Loading Hugging Face model: {model_ref}")
+        pipe = StableDiffusionPipeline.from_pretrained(model_ref)
+
     pipe = pipe.to(device)
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception:
-        try:
-            pipe.enable_attention_slicing()
-        except Exception:
-            pass
     return pipe
 
 
@@ -319,14 +329,31 @@ def run_pipeline(
     ensure_dir(outdir)
 
     # Mode 1: Stable Diffusion + adapter (LoRA)
+    # Mode 1: Stable Diffusion + adapter (LoRA)
     if mode == 1:
-        pipe = load_sd_pipeline(base_model, device=DEVICE)
-        ok = inject_lora_from_safetensors(pipe, str(adapter_filename), multiplier=1.0)
-        if not ok:
-            logger.warning("Adapter injection may have failed. Proceeding anyway (adapter not applied).")
+        # 1. Load the base SD pipeline first
+        try:
+            pipe = load_sd_pipeline(base_model, device=DEVICE)
+        except Exception as e:
+            logger.error(f"Failed to load base model {base_model}: {e}")
+            return
+
+        # 2. Load the LoRA adapter
+        try:
+            pipe.load_lora_weights(str(adapter_filename))
+            logger.info(f"Loaded LoRA adapter from {adapter_filename}")
+        except Exception as e:
+            logger.error(f"Failed to load LoRA adapter {adapter_filename}: {e}")
+
+        # 3. Generate with refined + baseline prompts
         generated = generate_and_save_images(pipe, refined_prompt, SEEDS, outdir, basename=f"{class_name}_mode1")
-        logger.info("Generated images: " + ", ".join(generated))
-        return generated
+        logger.info("Generated images (refined prompt): " + ", ".join(generated))
+
+        baseline = generate_and_save_images(pipe, HARDCODED_PROMPT, [SEEDS[0]], outdir, basename=f"{class_name}_mode1_baseline")
+        logger.info("Generated baseline (hardcoded prompt): " + ", ".join(baseline))
+
+        return generated + baseline
+
 
     # Mode 2: ChatGPT image generation only (no SD/adapter)
     elif mode == 2:
@@ -417,21 +444,38 @@ def run_pipeline(
             except Exception as e:
                 logger.error(f"Failed to load base model {model_id}: {e}")
                 continue
-            ok = inject_lora_from_safetensors(pipe, str(adapter_filename), multiplier=1.0)
-            if not ok:
-                logger.warning(f"Adapter injection for model {model_id} may have failed.")
-            model_outdir = outdir / Path(model_id.replace("/", "_"))
-            ensure_dir(model_outdir)
-            generated = generate_and_save_images(pipe, refined_prompt, SEEDS, model_outdir, basename=f"{class_name}_{Path(model_id).name}_mode3")
-            all_results[model_id] = generated
+
+            # --- model-specific output directory ---
+            model_outdir = out_root / f"{class_name}_{Path(model_id).name}_mode3"
+            model_outdir.mkdir(parents=True, exist_ok=True)
+
+            # --- try loading adapter ---
+            try:
+                pipe.load_lora_weights(str(adapter_filename))
+                logger.info(f"Loaded LoRA adapter from {adapter_filename}")
+            except Exception as e:
+                logger.warning(f"Failed to load LoRA adapter {adapter_filename} for {model_id}: {e}")
+
+            # --- refined prompt ---
+            generated = generate_and_save_images(
+                pipe, refined_prompt, SEEDS, model_outdir,
+                basename=f"{class_name}_{Path(model_id).name}_mode3"
+            )
+
+            # --- baseline hardcoded prompt (just 1 image, 1 seed) ---
+            baseline = generate_and_save_images(
+                pipe, HARDCODED_PROMPT, [SEEDS[0]], model_outdir,
+                basename=f"{class_name}_{Path(model_id).name}_mode3_baseline"
+            )
+
+            all_results[model_id] = {"refined": generated, "baseline": baseline}
+
         logger.info(f"Mode 3 generation complete. Results: {json.dumps(all_results, indent=2)}")
         return all_results
 
-    else:
-        logger.error("Unsupported mode. Choose 1, 2, or 3.")
-        return
-
-
+    
+    
+    
 # ==========================
 # CLI
 # ==========================

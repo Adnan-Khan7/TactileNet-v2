@@ -1,11 +1,11 @@
 #!/bin/bash
-# test.sh - launcher for test1.py and test2.py (C vs D)
+
 
 # Example image path (change this to your input image)
 IMAGE_PATH="/home/student/khan/image_gen_pipe/imgs/airplane.png"
 
 # Mode (1, 2, or 3)
-MODE=2
+MODE=3
 
 # Adapters directory
 ADAPTERS="./adapters"
