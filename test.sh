@@ -1,7 +1,9 @@
 #!/bin/bash
 
+# ============================
+# Runner for TactileNet
+# ============================
 
-# Example image path (change this to your input image)
 IMAGE_PATH="/home/student/khan/image_gen_pipe/imgs/airplane.png"
 
 # Mode (1, 2, or 3)
@@ -9,13 +11,22 @@ MODE=1
 
 # Adapters directory
 ADAPTERS="./adapters"
-# /home/student/khan/youssif/instruct_reward_model/train_results/30_epochs_clip+lpips/lora_adapters/unet/adapter_model.safetensors
 
 # Base model (used in mode 1 and 2)
 BASE_MODEL="runwayml/stable-diffusion-v1-5"
 
 # Output directory
 OUTDIR="./outputs"
+
+echo "============================================="
+echo "      Running TactileNet Pipeline       "
+echo "============================================="
+echo " Image:        $IMAGE_PATH"
+echo " Mode:         $MODE"
+echo " Adapters dir: $ADAPTERS"
+echo " Base model:   $BASE_MODEL"
+echo " Output dir:   $OUTDIR"
+echo "============================================="
 
 # Call Python script
 python test.py \
@@ -24,3 +35,4 @@ python test.py \
   --adapters "$ADAPTERS" \
   --base_model "$BASE_MODEL" \
   --out "$OUTDIR"
+

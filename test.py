@@ -40,8 +40,6 @@ from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tactile_pipeline")
-logger.info("Hello to TactileNet platform!")
-
 # ==============
 # Global config
 # ==============
@@ -60,7 +58,7 @@ SKIP_SAFETY_CHECK = True
 HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
 ADAPTERS_DIR = Path("./adapters")
 # DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5" # v1.5 SD
-DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/adapters/deliberate_v3.safetensors" # the chosen base model of TactileNet pipeline, also based on V1.5
+DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors" # the chosen base model of TactileNet pipeline, also based on V1.5
 
 # mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
@@ -73,7 +71,7 @@ BASE_MODELS_FOR_MODE3 = [
 # It includes the object type and patterns to be highlighted in the tactile graphic.
 
 PROMPT_TEMPLATE = (
-    "Create a tactile graphic of an {object}, specifically designed for individuals "
+    "Create a tactile graphic of a/an {object}, specifically designed for individuals "
     "with visual impairments. The graphic should feature raised, smooth lines to delineate the {patterns}, "
     "against a simplistic background"
 )
@@ -238,8 +236,6 @@ def load_sd_pipeline(
     return pipe
 
 
-
-
 def generate_and_save_images(
     pipeline,
     prompt: str,
@@ -257,21 +253,25 @@ def generate_and_save_images(
     def truncate_prompt_for_pipeline(text, pipeline):
         if text is None:
             return None
-        # Tokenize with the pipeline's tokenizer
-        tokens = pipeline.tokenizer(
+            
+        # Tokenize with the pipeline's tokenizer and truncate
+        inputs = pipeline.tokenizer(
             text,
-            padding="do_not_pad",
-            truncation=False,
+            padding="max_length",
+            max_length=pipeline.tokenizer.model_max_length,
+            truncation=True,
             return_tensors="pt",
-        ).input_ids[0]
+        )
         
-        if len(tokens) > pipeline.tokenizer.model_max_length:
-            # Truncate to the model's max length
-            tokens = tokens[:pipeline.tokenizer.model_max_length]
-            truncated_text = pipeline.tokenizer.decode(tokens, skip_special_tokens=True)
-            logger.warning(f"Prompt truncated to {pipeline.tokenizer.model_max_length} tokens. Original length: {len(tokens)}")
-            return truncated_text
-        return text
+        # Decode the truncated tokens back to text
+        truncated_text = pipeline.tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True)
+        
+        # Check if truncation occurred
+        original_tokens = pipeline.tokenizer(text, return_tensors="pt").input_ids[0]
+        if len(original_tokens) > pipeline.tokenizer.model_max_length:
+            logger.warning(f"Prompt truncated to {pipeline.tokenizer.model_max_length} tokens. Original length: {len(original_tokens)}")
+            
+        return truncated_text
 
     # Truncate both prompt and negative prompt
     truncated_prompt = truncate_prompt_for_pipeline(prompt, pipeline)
@@ -286,6 +286,7 @@ def generate_and_save_images(
     for s in seeds:
         generator = torch.Generator(device=DEVICE).manual_seed(s)
         logger.info(f"Generating image for seed {s} ...")
+        
         with torch.autocast(DEVICE if DEVICE.startswith("cuda") else "cpu"):
             if init_img is not None and isinstance(pipeline, StableDiffusionImg2ImgPipeline):
                 image = pipeline(
@@ -315,7 +316,6 @@ def generate_and_save_images(
         logger.info(f"Saved {fname}")
         results.append(str(fname))
     return results
-
 
 
 # ==========================
