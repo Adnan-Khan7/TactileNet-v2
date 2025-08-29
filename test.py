@@ -40,6 +40,20 @@ from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tactile_pipeline")
+
+# Sanity checks
+if not os.environ.get("OPENAI_API_KEY"):
+    logger.error("OPENAI_API_KEY environment variable not set!")
+    exit(1)
+else:
+    logger.info("OPENAI_API_KEY is set")
+
+if not os.environ.get("HF_TOKEN"):
+    logger.warning("HF_TOKEN environment variable not set - this may cause issues with HuggingFace models")
+    
+    
+
+
 # ==============
 # Global config
 # ==============
@@ -63,8 +77,10 @@ DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3
 # mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
     "runwayml/stable-diffusion-v1-5",
+    "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors",
     "Linaqruf/anything-v3.0",
     "CompVis/stable-diffusion-v1-4",
+    "/home/student/khan/image_gen_pipe/base_model/anythingV3_fp16.ckpt",
 ]
 # Prompt template for ChatGPT refinement
 # This template is used to generate a prompt for tactile graphics based on the identified class.
@@ -131,6 +147,26 @@ def load_image(path: str, size: Optional[int] = None) -> Image.Image:
         img = img.resize((size, size), Image.Resampling.LANCZOS)
     return img
 
+# def list_available_models():
+#     if not client:
+#         logger.error("No OpenAI client available.")
+#         return
+#     try:
+#         models = client.models.list()
+#         # client.models.list() returns a dict-like or object; handle both
+#         items = models.data if hasattr(models, "data") else models.get("data", models)
+#         logger.info("Models available for this key (partial list):")
+#         for m in items[:200]:
+#             # print id / name
+#             if isinstance(m, dict):
+#                 logger.info(f" - {m.get('id')}")
+#             else:
+#                 logger.info(f" - {getattr(m, 'id', str(m))}")
+#     except Exception as e:
+#         logger.error(f"Failed to list models: {e}")
+
+# # call once:
+# list_available_models()
 
 # ==========================
 # Class detection (CLIP)
@@ -189,7 +225,7 @@ def refine_prompt_with_chatgpt(class_name: str, image_path: str, template: str, 
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt_for_model},

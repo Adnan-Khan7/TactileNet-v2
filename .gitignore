@@ -2,3 +2,7 @@ imgs/*
 outputs/*
 adapters/*
 base_model/*
+check_quota.py
+api_key.txt
+.DS_Store
+
