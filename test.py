@@ -68,20 +68,26 @@ NEGATIVE_PROMPT = ""                # set if you want (e.g., "blurry, low qualit
 USE_IMG2IMG_FOR_MODE1 = True        # because we're relying on a natural image
 
 SKIP_SAFETY_CHECK = True  
-
-HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
+HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane."
+# HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
 ADAPTERS_DIR = Path("./adapters")
 # DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5" # v1.5 SD
 DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors" # the chosen base model of TactileNet pipeline, also based on V1.5
 
+# # mode 3 purpose is to apply the adapter on multiple base models for comparison.
+# BASE_MODELS_FOR_MODE3 = [
+#     "runwayml/stable-diffusion-v1-5",
+#     "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors",
+#     "Linaqruf/anything-v3.0",
+#     "CompVis/stable-diffusion-v1-4",
+#     "/home/student/khan/image_gen_pipe/base_model/anythingV3_fp16.ckpt",
+# ]
+
 # mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
-    "runwayml/stable-diffusion-v1-5",
     "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors",
-    "Linaqruf/anything-v3.0",
-    "CompVis/stable-diffusion-v1-4",
-    "/home/student/khan/image_gen_pipe/base_model/anythingV3_fp16.ckpt",
 ]
+
 # Prompt template for ChatGPT refinement
 # This template is used to generate a prompt for tactile graphics based on the identified class.
 # It includes the object type and patterns to be highlighted in the tactile graphic.
@@ -147,26 +153,6 @@ def load_image(path: str, size: Optional[int] = None) -> Image.Image:
         img = img.resize((size, size), Image.Resampling.LANCZOS)
     return img
 
-# def list_available_models():
-#     if not client:
-#         logger.error("No OpenAI client available.")
-#         return
-#     try:
-#         models = client.models.list()
-#         # client.models.list() returns a dict-like or object; handle both
-#         items = models.data if hasattr(models, "data") else models.get("data", models)
-#         logger.info("Models available for this key (partial list):")
-#         for m in items[:200]:
-#             # print id / name
-#             if isinstance(m, dict):
-#                 logger.info(f" - {m.get('id')}")
-#             else:
-#                 logger.info(f" - {getattr(m, 'id', str(m))}")
-#     except Exception as e:
-#         logger.error(f"Failed to list models: {e}")
-
-# # call once:
-# list_available_models()
 
 # ==========================
 # Class detection (CLIP)
@@ -254,14 +240,47 @@ def load_sd_pipeline(
     img2img: bool = False,
 ):
     logger.info(f"Loading SD {'img2img' if img2img else 'txt2img'} pipeline for {model_id}...")
-    PipeClass = StableDiffusionImg2ImgPipeline if img2img else StableDiffusionPipeline
-    pipe = PipeClass.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
-        token=use_auth_token,
-    )
+    
+    # Check if model_id is a local .safetensors file
+    model_path = Path(model_id)
+    if model_path.exists() and model_path.suffix == '.safetensors':
+        logger.info(f"Loading model from local safetensors file: {model_id}")
+        
+        # Use from_single_file method for loading safetensors (available in newer diffusers versions)
+        try:
+            PipeClass = StableDiffusionImg2ImgPipeline if img2img else StableDiffusionPipeline
+            pipe = PipeClass.from_single_file(
+                model_id,
+                torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+                safety_checker=None if SKIP_SAFETY_CHECK else None,
+            )
+        except AttributeError:
+            # Fall back to manual loading for older diffusers versions
+            logger.warning("from_single_file not available, using manual loading")
+            from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
+            
+            pipe = download_from_original_stable_diffusion_ckpt(
+                checkpoint_path_or_dict=model_id,
+                from_safetensors=True,
+                device=device,
+                load_safety_checker=not SKIP_SAFETY_CHECK,
+            )
+            
+            # Convert to appropriate pipeline class
+            PipeClass = StableDiffusionImg2ImgPipeline if img2img else StableDiffusionPipeline
+            pipe = PipeClass(**pipe.components)
+    else:
+        # It's a model ID, load normally
+        PipeClass = StableDiffusionImg2ImgPipeline if img2img else StableDiffusionPipeline
+        pipe = PipeClass.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+            token=use_auth_token,
+        )
+    
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
+    
     try:
         pipe.enable_xformers_memory_efficient_attention()
     except Exception:
@@ -269,6 +288,7 @@ def load_sd_pipeline(
             pipe.enable_attention_slicing()
         except Exception:
             pass
+    
     return pipe
 
 

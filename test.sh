@@ -7,13 +7,14 @@
 IMAGE_PATH="/home/student/khan/image_gen_pipe/imgs/airplane.png"
 
 # Mode (1, 2, or 3)
-MODE=3
+MODE=2
 
 # Adapters directory
 ADAPTERS="./adapters"
 
-# Base model (used in mode 1 and 2)
-BASE_MODEL="runwayml/stable-diffusion-v1-5"
+# Required for mode 1
+# BASE_MODEL="/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors"
+BASE_MODEL=""
 
 # Output directory
 OUTDIR="./outputs"
