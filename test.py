@@ -3,7 +3,7 @@ tactile_pipeline.py
 Mode behaviors:
  - mode=1: Use ChatGPT (M1) to refine prompt, load adapter (M3), generate 4 images with SD v1.5 (M2).
  - mode=2: Use ChatGPT image API only (M1 generates the image directly, no SD/LoRA used).
- - mode=3: Use ChatGPT to refine prompt, apply class-specific adapter (M3) on top of three different SD base models and generate images.
+ - mode=3: Use ChatGPT to refine prompt, apply class-specific adapter (M3) on top of N different SD base models and generate images.
 
 Notes:
  - Set environment variables OPENAI_API_KEY and HF_TOKEN as needed.
@@ -27,33 +27,32 @@ import openai as openai_legacy
 from transformers import CLIPProcessor, CLIPModel
 from safetensors.torch import load_file as safetensors_load
 from compel import Compel, ReturnedEmbeddingsType
-
-
-# more imports
+from diffusers import DPMSolverMultistepScheduler
 from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionImg2ImgPipeline,
     DPMSolverMultistepScheduler,
 )
 from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
+from transformers.utils import logging as hf_logging
+import warnings
 
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tactile_pipeline")
 
+hf_logging.set_verbosity_warning()         # transformers to WARNING
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", message="Using a slow image processor.*")
+
 # Sanity checks
 if not os.environ.get("OPENAI_API_KEY"):
     logger.error("OPENAI_API_KEY environment variable not set!")
     exit(1)
-else:
-    logger.info("OPENAI_API_KEY is set")
 
 if not os.environ.get("HF_TOKEN"):
     logger.warning("HF_TOKEN environment variable not set - this may cause issues with HuggingFace models")
-    
-    
-
-
 # ==============
 # Global config
 # ==============
@@ -61,27 +60,18 @@ CLASS_NAMES = [
     # we have total = 66 classes, but for brevity, we will use a subset here.
     "cat", "dog", "airplane", "car", "bicycle", "chair",
 ]
-
+RUN_LOG_FILENAME = "run_log.jsonl"
+OPENAI_IMAGE_MODEL = "gpt-image-1"  # version used for Mode 2 image generation
+OPENAI_VISION_MODEL = "gpt-4o-mini"     # for vision-based prompt refinement
 # Img2Img controls
 DEFAULT_DENOISING_STRENGTH = 0.9   # lower = stick closer to source image
 NEGATIVE_PROMPT = ""                # set if you want (e.g., "blurry, low quality")
 USE_IMG2IMG_FOR_MODE1 = True        # because we're relying on a natural image
 
 SKIP_SAFETY_CHECK = True  
-HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane."
-# HARDCODED_PROMPT = "Create a tactile graphic of a frontal view of an airplane, tailored for the visually impaired. The design should have raised, smooth lines to illustrate the plane's nose, cockpit windows, and wings spread wide, set against a plain background for clear contrast. The circular shape of the engines under each wing should be delineated with raised lines, and the cockpit windows' outline should be smoothly raised. The tires should be depicted with distinct raised textures to convey the rubbery material, contrasting with the plane's body's smoothness. The symmetry of the airplane should be emphasized with uniform raised lines to allow tactile comparison from left to right."
+HARDCODED_PROMPT = "Create a tactile graphic of given object."
 ADAPTERS_DIR = Path("./adapters")
-# DEFAULT_BASE_MODEL = "runwayml/stable-diffusion-v1-5" # v1.5 SD
-DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors" # the chosen base model of TactileNet pipeline, also based on V1.5
-
-# # mode 3 purpose is to apply the adapter on multiple base models for comparison.
-# BASE_MODELS_FOR_MODE3 = [
-#     "runwayml/stable-diffusion-v1-5",
-#     "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors",
-#     "Linaqruf/anything-v3.0",
-#     "CompVis/stable-diffusion-v1-4",
-#     "/home/student/khan/image_gen_pipe/base_model/anythingV3_fp16.ckpt",
-# ]
+DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors" 
 
 # mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
@@ -89,17 +79,16 @@ BASE_MODELS_FOR_MODE3 = [
 ]
 
 # Prompt template for ChatGPT refinement
-# This template is used to generate a prompt for tactile graphics based on the identified class.
-# It includes the object type and patterns to be highlighted in the tactile graphic.
-
+# Improved template with more tactile-specific details and design principles
 PROMPT_TEMPLATE = (
-    "Create a tactile graphic of a/an {object}, specifically designed for individuals "
-    "with visual impairments. The graphic should feature raised, smooth lines to delineate the {patterns}, "
-    "against a simplistic background"
+    "Create a tactile graphic of {object} for visually impaired users. "
+    "Focus on clear raised outlines of main features, distinct textural differences for different parts, "
+    "simplified but accurate proportions, and high contrast between elements. "
+    "Key features to emphasize: {patterns}"
 )
 
 try:
-    CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+    CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 except Exception as e:
     logger.error(f"Failed to load CLIP tokenizer: {e}")
     CLIP_TOKENIZER = None
@@ -136,15 +125,110 @@ if OPENAI_API_KEY:
 else:
     logger.warning("OPENAI_API_KEY not set. Mode 2 (ChatGPT image generation) will fail without it.")
 
-# CLIP
-CLIP_MODEL_NAME = "openai/clip-vit-base-patch32" # used for class detection
+# CLIP - upgraded to larger model
+CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"  # used for class detection
 
 # ==============
 # Utilities
 # ==============
+def image_to_data_url(image_path: str) -> str:
+    p = Path(image_path)
+    mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+    b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+def generate_image_via_openai_edit(prompt: str, size_arg: str, image_path: str, tmp_dir: Path):
+    """
+    Try client.images.edits (OpenAI SDK v1+). If unavailable, call the REST endpoint directly.
+    Returns the response object (client SDK) or dict (HTTP JSON).
+    """
+    # Ensure PNG for the edits endpoint
+    src_png = ensure_png_for_openai(image_path, tmp_dir)
+    
+    # 1) Preferred: SDK v1 method (if available in your installed version)
+    try:
+        if hasattr(client, "images") and hasattr(client.images, "edits"):
+            return client.images.edits(
+                model=OPENAI_IMAGE_MODEL,
+                image=open(src_png, "rb"),
+                prompt=prompt,
+                size=size_arg,
+                n=1,
+            )
+    except Exception as e:
+        logger.warning(f"OpenAI client.images.edits failed; will try HTTP fallback: {e}")
+
+    # 2) Fallback: direct HTTP call to /v1/images/edits (works regardless of SDK version)
+    try:
+        import httpx
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        }
+        with open(src_png, "rb") as f:
+            files = {
+                "image": ("image.png", f, "image/png"),
+            }
+            data = {
+                "model": OPENAI_IMAGE_MODEL,
+                "prompt": prompt,
+                "size": size_arg,
+                "n": "1",
+            }
+            r = httpx.post(
+                "https://api.openai.com/v1/images/edits",
+                headers=headers,
+                data=data,
+                files=files,
+                timeout=60.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e_http:
+        raise RuntimeError(f"OpenAI image edit failed via client and HTTP fallback: {e_http}")
+
+
+def ensure_png_for_openai(image_path: str, tmp_dir: Path) -> Path:
+    p = Path(image_path)
+    if p.suffix.lower() == ".png":
+        return p
+    ensure_dir(tmp_dir)
+    tmp_png = tmp_dir / (p.stem + "_openai_tmp.png")
+    img = Image.open(str(p)).convert("RGB")
+    img.save(tmp_png, format="PNG")
+    return tmp_png
 
 def ensure_dir(d: Path):
     d.mkdir(parents=True, exist_ok=True)
+
+def append_run_log(
+    out_root: Path,
+    mode: int,
+    object_category: str,
+    refined_prompt: str,
+    prompt_used_for_generation: str,
+    baseline_model: str,
+):
+    """
+    Append one record to a single JSONL log file under out_root.
+    Fields:
+    - mode
+    - object_category
+    - refined_prompt
+    - prompt_used_for_generation
+    - baseline_model
+    """
+    ensure_dir(out_root)
+    record = {
+        "mode": mode,
+        "object_category": object_category,
+        "refined_prompt": refined_prompt,
+        "prompt_used_for_generation": prompt_used_for_generation,
+        "baseline_model": baseline_model,
+    }
+    log_path = out_root / RUN_LOG_FILENAME
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 
 
 def load_image(path: str, size: Optional[int] = None) -> Image.Image:
@@ -194,39 +278,69 @@ def refine_prompt_with_chatgpt(class_name: str, image_path: str, template: str, 
         patterns = "major contours and prominent features"
         return template.format(object=class_name, patterns=patterns)
 
-    system_msg = "You are a helpful assistant that inspects an image and produces short bullet features describing the main tactile-relevant features."
-    if mode2_designer:
-        system_msg = (
-            "You are an expert tactile designer. Take your time to apply tactile designing principles (e.g., BANA) "
-            "and produce a refined prompt for a tactile graphic. Output must be a single sentence (no code) suitable for an image-generation prompt."
-        )
-
-    prompt_for_model = (
-        f"Image: {Path(image_path).name}\n"
-        f"Class identified: {class_name}\n"
-        "Describe the primary tactile features to include (2-5 features), short phrases only.\n"
-        "Examples: 'whiskers', 'rounded ears', 'long tail', 'paw pads', 'beak', 'wings'.\n"
-        "Return only a comma-separated list of the features.\n"
-    )
+        # Build vision input
+    try:
+        data_url = image_to_data_url(image_path)
+    except Exception as e:
+        logger.warning(f"Failed to prepare image for vision model: {e}. Falling back to text-only refinement.")
+        data_url = None
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt_for_model},
-            ],
-            max_tokens=200,
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content.strip()
-        features = content.splitlines()[0]
-        features = features.replace(" and ", ",").strip()
-        final_prompt = template.format(object=class_name, patterns=features)
-        logger.info(f"Refined prompt from ChatGPT: {final_prompt}")
-        return final_prompt
+        if mode2_designer:
+            # Vision + single-sentence refined prompt
+            system_msg = (
+                "You are an expert tactile designer. Apply tactile design principles (e.g., BANA). "
+                "Given an input image, produce ONE concise sentence suitable for an image-generation prompt "
+                "highlighting the specific tactile-relevant features present in THIS image. No preamble."
+            )
+            user_text = f"Class identified: {class_name}."
+            user_content = [{"type": "text", "text": user_text}]
+            if data_url:
+                user_content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+            resp = client.chat.completions.create(
+                model=OPENAI_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=250,
+                temperature=0.2,
+            )
+            final_prompt = resp.choices[0].message.content.strip()
+            logger.info(f"Refined prompt (vision): {final_prompt}")
+            return final_prompt
+        else:
+            # Vision + features list -> fill template
+            system_msg = (
+                "You are a helpful assistant that inspects an image and identifies tactile-relevant features. "
+                "Return only a short comma-separated list of 2-6 phrases (no numbering, no extra text)."
+            )
+            user_text = (
+                f"Class identified: {class_name}\n"
+                "List tactile features present in THIS image (e.g., 'rounded ears', 'long tail', 'paw pads')."
+            )
+            user_content = [{"type": "text", "text": user_text}]
+            if data_url:
+                user_content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+            resp = client.chat.completions.create(
+                model=OPENAI_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=150,
+                temperature=0.2,
+            )
+            content = resp.choices[0].message.content.strip()
+            features_line = content.splitlines()[0]
+            features = features_line.replace(" and ", ",").strip()
+            final_prompt = template.format(object=class_name, patterns=features)
+            logger.info(f"Refined prompt from ChatGPT (vision): {final_prompt}")
+            return final_prompt
     except Exception as e:
-        logger.warning(f"OpenAI call failed: {e}. Falling back to template-only prompt.")
+        logger.warning(f"OpenAI vision call failed: {e}. Falling back to template-only prompt.")
         patterns = "major contours and prominent features"
         return template.format(object=class_name, patterns=patterns)
 
@@ -277,7 +391,7 @@ def load_sd_pipeline(
             torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
             token=use_auth_token,
         )
-    
+        
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
     
@@ -386,7 +500,30 @@ def run_pipeline(
     base_models_for_mode3: List[str] = BASE_MODELS_FOR_MODE3,
     out_root: Path = Path("./outputs"),
 ):
+    # Set up file logging in the output directory
     ensure_dir(out_root)
+    log_file = out_root / f"pipeline_log_mode{mode}.txt"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    logger.info("=============================================")
+    logger.info("      Starting TactileNet Pipeline       ")
+    logger.info("=============================================")
+    logger.info(f"Image: {image_path}")
+    logger.info(f"Mode: {mode}")
+    if mode in (1, 3):
+        logger.info(f"Adapters dir: {adapters_dir}")
+        logger.info(f"Base model: {base_model}")
+    elif mode == 2:
+    # define once near globals if you haven’t already:
+    # OPENAI_IMAGE_MODEL = "gpt-image-1"
+        logger.info(f"Image model: {OPENAI_IMAGE_MODEL}")
+    logger.info(f"Output dir: {out_root}")
+    logger.info("=============================================")
+
     detector = ClassDetectorCLIP(device=DEVICE)
     class_name, sim = detector.detect_class(image_path, class_list)
     if class_name is None:
@@ -395,6 +532,7 @@ def run_pipeline(
 
     mode2_designer = (mode == 2)
     refined_prompt = refine_prompt_with_chatgpt(class_name, image_path, PROMPT_TEMPLATE, mode2_designer=mode2_designer)
+    logger.info(f"Refined prompt: {refined_prompt}")
 
     # For modes that require an adapter (1 and 3), check adapter availability.
     adapter_filename = adapters_dir / f"tactile_{class_name}.safetensors"
@@ -407,6 +545,7 @@ def run_pipeline(
 
     # Mode 1: Stable Diffusion + adapter (LoRA)
     if mode == 1:
+        logger.info("Running Mode 1: Stable Diffusion with adapter")
         # Use img2img so we can set denoising strength (we rely on the natural image)
         pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
         try:
@@ -439,23 +578,29 @@ def run_pipeline(
         )
         logger.info("Generated baseline (hardcoded prompt): " + ", ".join(baseline))
 
+        # Log details for analysis
+        logger.info(f"Mode 1 completed. Model used: {base_model}, Adapter: {adapter_filename}")
+        logger.info(f"Refined prompt: {refined_prompt}")
+        logger.info(f"Hardcoded prompt: {HARDCODED_PROMPT}")
+
         return generated + baseline
 
     # Mode 2: ChatGPT image generation only (no SD/adapter)
     elif mode == 2:
+        logger.info("Running Mode 2: ChatGPT image generation")
         if not client:
             logger.error("OpenAI client not configured (OPENAI_API_KEY missing). Cannot run mode 2.")
             return []
 
         # Compose tactile-design prompt
         prompt = (
-            f"Convert this natural image into a tactile graphic for individuals with visual impairments. "
-            f"Follow tactile design principles (e.g., BANA). "
-            f"Focus on raised, smooth lines to delineate key features. "
-            f"Class: {class_name}. "
-            f"Prompt template: {PROMPT_TEMPLATE}. "
-            f"Refined prompt: {refined_prompt}"
+            "Convert this natural image into a tactile graphic for individuals with visual impairments. "
+            "Follow tactile design principles (e.g., BANA). "
+            "Focus on raised, smooth lines to delineate key features. "
+            f"{refined_prompt}"
         )
+        logger.info("Running Mode 2: ChatGPT image generation (image-to-image via edits)")
+        logger.info(f"Using ChatGPT image model: {OPENAI_IMAGE_MODEL}")
 
         # Compatible sizes supported by the OpenAI image endpoint
         SUPPORTED_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
@@ -474,11 +619,12 @@ def run_pipeline(
 
         try:
             # NOTE: do not pass `response_format` parameter (not supported by all clients).
-            resp = client.images.generate(
-                model="gpt-image-1",
+            src_png = ensure_png_for_openai(image_path, outdir)
+            resp = generate_image_via_openai_edit(
                 prompt=prompt,
-                size=size_arg,
-                n=1,
+                size_arg=size_arg,
+                image_path=image_path,
+                tmp_dir=outdir,
             )
 
             # --- robustly extract returned image data ---
@@ -515,6 +661,16 @@ def run_pipeline(
             out_file = outdir / f"{class_name}_mode2_chatgpt.png"
             img.save(out_file)
             logger.info(f"Saved ChatGPT-generated tactile image to {out_file}")
+            logger.info(f"Mode 2 completed. Model used: ChatGPT image API")
+            logger.info(f"Prompt sent to ChatGPT: {prompt}")
+            append_run_log(
+                out_root=out_root,
+                mode=mode,
+                object_category=class_name,
+                refined_prompt=refined_prompt,
+                prompt_used_for_generation=prompt,
+                baseline_model=OPENAI_IMAGE_MODEL,
+            )
             return [str(out_file)]
 
         except Exception as e:
@@ -523,6 +679,7 @@ def run_pipeline(
 
     # Mode 3: Apply adapter on multiple base models
     elif mode == 3:
+        logger.info("Running Mode 3: Apply adapter on multiple base models")
         all_results = {}
         for model_id in base_models_for_mode3:
             try:
@@ -547,19 +704,39 @@ def run_pipeline(
                 pipe, refined_prompt, SEEDS, model_outdir,
                 basename=f"{class_name}_{Path(model_id).name}_mode3"
             )
-
+            append_run_log(
+                out_root=out_root,
+                mode=3,
+                object_category=class_name,
+                refined_prompt=refined_prompt,
+                prompt_used_for_generation=refined_prompt,
+                baseline_model=str(model_id),
+            )
             # --- baseline hardcoded prompt (just 1 image, 1 seed) ---
             baseline = generate_and_save_images(
                 pipe, HARDCODED_PROMPT, [SEEDS[0]], model_outdir,
                 basename=f"{class_name}_{Path(model_id).name}_mode3_baseline"
             )
+            append_run_log(
+                out_root=out_root,
+                mode=3,
+                object_category=class_name,
+                refined_prompt=refined_prompt,
+                prompt_used_for_generation=HARDCODED_PROMPT,
+                baseline_model=str(model_id),
+            )
 
             all_results[model_id] = {"refined": generated, "baseline": baseline}
+            logger.info(f"Model {model_id} completed. Adapter: {adapter_filename}")
+            logger.info("Refined prompt (full): %s", refined_prompt)
+            logger.info(f"Hardcoded prompt: {HARDCODED_PROMPT}")
 
         logger.info(f"Mode 3 generation complete. Results: {json.dumps(all_results, indent=2)}")
         return all_results
 
-    
+    # Remove file handler to avoid duplicate logs in future runs
+    logger.removeHandler(file_handler)
+    file_handler.close()
     
     
 # ==========================
