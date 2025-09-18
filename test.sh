@@ -2,11 +2,14 @@
 
 # ============================
 # Runner for TactileNet
-# python test.py --mode 1 --dataset_jsonl test_dataset.jsonl --dataset_base /home/student/khan/image_gen_pipe/ --adapters ./adapters --base_model /home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors --out ./outputs/dataset_run
 # Run: python test.py --mode 1 --dataset_jsonl /test_dataset.jsonl --dataset_base /path/to/repo/root --adapters ./adapters --base_model /path/to/base.safetensors --out ./outputs/dataset_run
+
+# Example usage:
+# mode 1: with adapters
+# python test.py --mode 1 --dataset_jsonl test_dataset.jsonl --dataset_base /home/student/khan/image_gen_pipe/ --adapters ./adapters --base_model /home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors
 # ============================
 
-IMG_DIR="/home/student/khan/image_gen_pipe/imgs/airplane"
+IMG_DIR="/home/student/khan/image_gen_pipe/imgs/"
 
 # Mode (1, 2, or 3)
 MODE=3
