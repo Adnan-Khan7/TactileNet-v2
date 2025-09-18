@@ -477,6 +477,7 @@ def run_pipeline(
     base_model: str = DEFAULT_BASE_MODEL,
     base_models_for_mode3: List[str] = BASE_MODELS_FOR_MODE3,
     out_root: Path = Path("./outputs"),
+    class_name_override: Optional[str] = None,
 ):
     # Set up file logging in the output directory
     ensure_dir(out_root)
@@ -502,8 +503,12 @@ def run_pipeline(
     logger.info(f"Output dir: {out_root}")
     logger.info("=============================================")
 
-    detector = ClassDetectorCLIP(device=DEVICE)
-    class_name, sim = detector.detect_class(image_path, class_list)
+    if class_name_override:
+        class_name = class_name_override
+        logger.info(f"Using provided class override: {class_name}")
+    else:
+        detector = ClassDetectorCLIP(device=DEVICE)
+        class_name, sim = detector.detect_class(image_path, class_list)
     if class_name is None:
         logger.error("User class un-identified (below similarity threshold). Quitting.")
         return
@@ -523,17 +528,40 @@ def run_pipeline(
 
     # Mode 1: Stable Diffusion + adapter (LoRA)
     if mode == 1:
-        logger.info("Running Mode 1: Stable Diffusion with adapter")
-        # Use img2img so we can set denoising strength (we rely on the natural image)
-        pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
+        logger.info("Running Mode 1: Stable Diffusion with adapter (img2img). Baseline: 1 image (no adapter) + 4 images (with adapter).")
+       
+        base_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
+        baseline = generate_and_save_images(
+            base_pipe,
+            refined_prompt,
+            [SEEDS[0]],
+            outdir,
+            basename=f"{class_name}_mode1_baseline",
+            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
+            denoising_strength=DEFAULT_DENOISING_STRENGTH,
+            negative_prompt=NEGATIVE_PROMPT,
+        )
+                    
+        append_run_log(
+            out_root=out_root,
+            mode=1,
+            object_category=class_name,
+            refined_prompt=refined_prompt,
+            prompt_used_for_generation=refined_prompt,
+            baseline_model=str(base_model),
+        )
+
+        # Adapter run: 4 images (with adapter) with the refined prompt
+        adapter_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
         try:
-            pipe.load_lora_weights(str(adapter_filename))
+            adapter_pipe.load_lora_weights(str(adapter_filename))
             logger.info(f"Loaded LoRA adapter from {adapter_filename}")
         except Exception as e:
             logger.error(f"Failed to load LoRA adapter {adapter_filename}: {e}")
-
+        
+        
         generated = generate_and_save_images(
-            pipe,
+            adapter_pipe,
             refined_prompt,
             SEEDS,
             outdir,
@@ -542,26 +570,18 @@ def run_pipeline(
             denoising_strength=DEFAULT_DENOISING_STRENGTH,
             negative_prompt=NEGATIVE_PROMPT,
         )
-        logger.info("Generated images (refined prompt): " + ", ".join(generated))
-
-        baseline = generate_and_save_images(
-            pipe,
-            HARDCODED_PROMPT,
-            [SEEDS[0]],
-            outdir,
-            basename=f"{class_name}_mode1_baseline",
-            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
-            denoising_strength=DEFAULT_DENOISING_STRENGTH,
-            negative_prompt=NEGATIVE_PROMPT,
+        append_run_log(
+            out_root=out_root,
+            mode=1,
+            object_category=class_name,
+            refined_prompt=refined_prompt,
+            prompt_used_for_generation=refined_prompt,
+            baseline_model=str(base_model),
         )
-        logger.info("Generated baseline (hardcoded prompt): " + ", ".join(baseline))
 
-        # Log details for analysis
-        logger.info(f"Mode 1 completed. Model used: {base_model}, Adapter: {adapter_filename}")
-        logger.info(f"Refined prompt: {refined_prompt}")
-        logger.info(f"Hardcoded prompt: {HARDCODED_PROMPT}")
+        logger.info("Mode 1 completed.")
 
-        return generated + baseline
+        return baseline + generated
 
     # Mode 2: ChatGPT image generation only (no SD/adapter)
     elif mode == 2:
@@ -660,27 +680,48 @@ def run_pipeline(
         logger.info("Running Mode 3: Apply adapter on multiple base models")
         all_results = {}
         for model_id in base_models_for_mode3:
+            # Create a subdirectory for this model
+            model_safe_name = Path(model_id).stem
+            model_outdir = outdir / model_safe_name
+            ensure_dir(model_outdir)
+            
             try:
-                pipe = load_sd_pipeline(model_id, device=DEVICE)
+                base_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
             except Exception as e:
                 logger.error(f"Failed to load base model {model_id}: {e}")
                 continue
-
-            # --- model-specific output directory ---
-            model_outdir = out_root / f"{class_name}_{Path(model_id).name}_mode3"
-            model_outdir.mkdir(parents=True, exist_ok=True)
-
-            # --- try loading adapter ---
+            
+            baseline = generate_and_save_images(
+                base_pipe, refined_prompt, [SEEDS[0]], model_outdir,
+                basename=f"{class_name}_{Path(model_id).name}_mode3_baseline",
+                init_image_path=image_path,
+                denoising_strength=DEFAULT_DENOISING_STRENGTH,
+                negative_prompt=NEGATIVE_PROMPT,
+            )
+            
+            append_run_log(
+                out_root=out_root,
+                mode=3,
+                object_category=class_name,
+                refined_prompt=refined_prompt,
+                prompt_used_for_generation=refined_prompt,
+                baseline_model=str(model_id),
+            )
+            
+            adapter_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
             try:
-                pipe.load_lora_weights(str(adapter_filename))
+                adapter_pipe.load_lora_weights(str(adapter_filename))
                 logger.info(f"Loaded LoRA adapter from {adapter_filename}")
             except Exception as e:
                 logger.warning(f"Failed to load LoRA adapter {adapter_filename} for {model_id}: {e}")
+                continue  # Skip this model if adapter loading fails
 
-            # --- refined prompt ---
             generated = generate_and_save_images(
-                pipe, refined_prompt, SEEDS, model_outdir,
-                basename=f"{class_name}_{Path(model_id).name}_mode3"
+                adapter_pipe, refined_prompt, SEEDS, model_outdir,
+                basename=f"{class_name}_{Path(model_id).name}_mode3",
+                init_image_path=image_path,
+                denoising_strength=DEFAULT_DENOISING_STRENGTH,
+                negative_prompt=NEGATIVE_PROMPT,
             )
             append_run_log(
                 out_root=out_root,
@@ -690,26 +731,7 @@ def run_pipeline(
                 prompt_used_for_generation=refined_prompt,
                 baseline_model=str(model_id),
             )
-            # --- baseline hardcoded prompt (just 1 image, 1 seed) ---
-            baseline = generate_and_save_images(
-                pipe, HARDCODED_PROMPT, [SEEDS[0]], model_outdir,
-                basename=f"{class_name}_{Path(model_id).name}_mode3_baseline"
-            )
-            append_run_log(
-                out_root=out_root,
-                mode=3,
-                object_category=class_name,
-                refined_prompt=refined_prompt,
-                prompt_used_for_generation=HARDCODED_PROMPT,
-                baseline_model=str(model_id),
-            )
-
-            all_results[model_id] = {"refined": generated, "baseline": baseline}
-            logger.info(f"Model {model_id} completed. Adapter: {adapter_filename}")
-            logger.info("Refined prompt (full): %s", refined_prompt)
-            logger.info(f"Hardcoded prompt: {HARDCODED_PROMPT}")
-
-        logger.info(f"Mode 3 generation complete. Results: {json.dumps(all_results, indent=2)}")
+            all_results[model_id] = {"baseline": baseline, "refined": generated}
         return all_results
 
     # Remove file handler to avoid duplicate logs in future runs

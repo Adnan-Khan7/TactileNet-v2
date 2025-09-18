@@ -11,15 +11,10 @@ MODE=3
 
 # Adapters directory
 ADAPTERS="./adapters"
-
-# Required for mode 1
-# BASE_MODEL="lykon/dreamshaper-7"
-# BASE_MODEL="Linaqruf/anything-v3-1"
-# BASE_MODEL="runwayml/stable-diffusion-v1-5"
-BASE_MODEL="stablediffusionapi/realistic-vision"
+BASE_MODEL="/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors"
 
 # Output directory
-OUTDIR="./outputs/chatgpt_image_gen"
+OUTDIR="./outputs/"
 
 echo "============================================="
 echo "      Running TactileNet Pipeline       "
