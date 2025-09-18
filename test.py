@@ -11,7 +11,6 @@ Notes:
 """
 # imports
 import json
-import math
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -21,19 +20,14 @@ import torch
 from PIL import Image
 import numpy as np
 import os
-from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
 from openai import OpenAI
-import openai as openai_legacy 
 from transformers import CLIPProcessor, CLIPModel
-from safetensors.torch import load_file as safetensors_load
-from compel import Compel, ReturnedEmbeddingsType
 from diffusers import DPMSolverMultistepScheduler
 from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionImg2ImgPipeline,
-    DPMSolverMultistepScheduler,
 )
-from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
+from transformers import CLIPProcessor, CLIPModel
 from transformers.utils import logging as hf_logging
 import warnings
 
@@ -87,23 +81,6 @@ PROMPT_TEMPLATE = (
     "Key features to emphasize: {patterns}"
 )
 
-try:
-    CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-except Exception as e:
-    logger.error(f"Failed to load CLIP tokenizer: {e}")
-    CLIP_TOKENIZER = None
-
-def truncate_prompt(prompt, max_length=77):
-    if CLIP_TOKENIZER is None:
-        return prompt  # fallback if tokenizer not available
-    tokens = CLIP_TOKENIZER.tokenize(prompt)
-    if len(tokens) > max_length:
-        tokens = tokens[:max_length]
-        truncated_prompt = CLIP_TOKENIZER.convert_tokens_to_string(tokens)
-        logger.warning(f"Prompt truncated to {max_length} tokens. Original length: {len(tokens)}")
-        return truncated_prompt
-    return prompt
-
 SEEDS = [42, 1234, 2025, 9999]
 HEIGHT = 512
 WIDTH = 512
@@ -117,11 +94,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", None)
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
-    # also set legacy openai module key for backward compat if used elsewhere
-    try:
-        openai_legacy.api_key = OPENAI_API_KEY
-    except Exception:
-        pass
 else:
     logger.warning("OPENAI_API_KEY not set. Mode 2 (ChatGPT image generation) will fail without it.")
 
@@ -366,18 +338,15 @@ def load_sd_pipeline(
             pipe = PipeClass.from_single_file(
                 model_id,
                 torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
-                safety_checker=None if SKIP_SAFETY_CHECK else None,
             )
         except AttributeError:
             # Fall back to manual loading for older diffusers versions
             logger.warning("from_single_file not available, using manual loading")
             from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
-            
             pipe = download_from_original_stable_diffusion_ckpt(
                 checkpoint_path_or_dict=model_id,
                 from_safetensors=True,
                 device=device,
-                load_safety_checker=not SKIP_SAFETY_CHECK,
             )
             
             # Convert to appropriate pipeline class
@@ -394,6 +363,11 @@ def load_sd_pipeline(
         
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
+    if SKIP_SAFETY_CHECK:
+        try:
+            pipe.safety_checker = None
+        except Exception:
+            pass
     
     try:
         pipe.enable_xformers_memory_efficient_attention()

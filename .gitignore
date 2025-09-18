@@ -6,3 +6,5 @@ check_quota.py
 api_key.txt
 .DS_Store
 _model_selection_outputs
+training_dataset/
+test_set/
