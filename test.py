@@ -70,6 +70,10 @@ DEFAULT_BASE_MODEL = "/home/student/khan/image_gen_pipe/base_model/deliberate_v3
 # mode 3 purpose is to apply the adapter on multiple base models for comparison.
 BASE_MODELS_FOR_MODE3 = [
     "/home/student/khan/image_gen_pipe/base_model/deliberate_v3.safetensors",
+    "/home/student/khan/image_gen_pipe/base_model/anything-v3-1.safetensors",
+    "stablediffusionapi/realistic-vision",
+    "stable-diffusion-v1-5/stable-diffusion-v1-5",
+    
 ]
 
 # Prompt template for ChatGPT refinement
@@ -78,7 +82,7 @@ PROMPT_TEMPLATE = (
     "Create a tactile graphic of {object} for visually impaired users. "
     "Focus on clear raised outlines of main features, distinct textural differences for different parts, "
     "simplified but accurate proportions, and high contrast between elements. "
-    "Key features to emphasize: {patterns}"
+    "Key features to emphasize: {patterns}."
 )
 
 SEEDS = [42, 1234, 2025, 9999]

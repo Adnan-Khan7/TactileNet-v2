@@ -7,7 +7,7 @@
 IMG_DIR="/home/student/khan/image_gen_pipe/imgs/airplane"
 
 # Mode (1, 2, or 3)
-MODE=2
+MODE=3
 
 # Adapters directory
 ADAPTERS="./adapters"
