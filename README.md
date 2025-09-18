@@ -1,4 +1,4 @@
-# TactileNet — Quick pipeline overview
+# TactileNet-v2 — Quick pipeline overview
 
 **Purpose (one line):**  
 TactileNet converts natural images into tactile-optimized graphics by combining automatic class detection (CLIP), ChatGPT prompt refinement (vision-capable model), and either Stable Diffusion (with LoRA adapters) or the OpenAI image API — useful for producing tactile designs for blind/low-vision users.
