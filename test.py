@@ -107,6 +107,23 @@ CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"  # used for class detection
 # ==============
 # Utilities
 # ==============
+def iter_dataset(jsonl_path: Path) -> List[Tuple[str, str]]:
+    """
+    Yields (category, input_image_path) from a JSONL file.
+    """
+    pairs = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            category = rec.get("Category")
+            img_path = rec.get("input_image")
+            if category and img_path:
+                pairs.append((category, img_path))
+    return pairs
+
+
 def image_to_data_url(image_path: str) -> str:
     p = Path(image_path)
     mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
@@ -465,7 +482,6 @@ def generate_and_save_images(
         results.append(str(fname))
     return results
 
-
 # ==========================
 # Main runner
 # ==========================
@@ -488,255 +504,257 @@ def run_pipeline(
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
-    logger.info("=============================================")
-    logger.info("      Starting TactileNet Pipeline       ")
-    logger.info("=============================================")
-    logger.info(f"Image: {image_path}")
-    logger.info(f"Mode: {mode}")
-    if mode in (1, 3):
-        logger.info(f"Adapters dir: {adapters_dir}")
-        logger.info(f"Base model: {base_model}")
-    elif mode == 2:
-    # define once near globals if you haven’t already:
-    # OPENAI_IMAGE_MODEL = "gpt-image-1"
-        logger.info(f"Image model: {OPENAI_IMAGE_MODEL}")
-    logger.info(f"Output dir: {out_root}")
-    logger.info("=============================================")
+    try:
+        logger.info("=============================================")
+        logger.info("      Starting TactileNet Pipeline       ")
+        logger.info("=============================================")
+        logger.info(f"Image: {image_path}")
+        logger.info(f"Mode: {mode}")
+        if mode in (1, 3):
+            logger.info(f"Adapters dir: {adapters_dir}")
+            logger.info(f"Base model: {base_model}")
+        elif mode == 2:
+            # define once near globals if you haven't already:
+            # OPENAI_IMAGE_MODEL = "gpt-image-1"
+            logger.info(f"Image model: {OPENAI_IMAGE_MODEL}")
+        logger.info(f"Output dir: {out_root}")
+        logger.info("=============================================")
 
-    if class_name_override:
-        class_name = class_name_override
-        logger.info(f"Using provided class override: {class_name}")
-    else:
-        detector = ClassDetectorCLIP(device=DEVICE)
-        class_name, sim = detector.detect_class(image_path, class_list)
-    if class_name is None:
-        logger.error("User class un-identified (below similarity threshold). Quitting.")
-        return
-
-    mode2_designer = (mode == 2)
-    refined_prompt = refine_prompt_with_chatgpt(class_name, image_path, PROMPT_TEMPLATE, mode2_designer=mode2_designer)
-    logger.info(f"Refined prompt: {refined_prompt}")
-
-    # For modes that require an adapter (1 and 3), check adapter availability.
-    adapter_filename = adapters_dir / f"tactile_{class_name}.safetensors"
-    if mode in (1, 3) and not adapter_filename.exists():
-        logger.error(f"Adapter for class {class_name} not found at {adapter_filename}. Quitting.")
-        return
-
-    outdir = out_root / f"{Path(image_path).stem}_{class_name}_mode{mode}"
-    ensure_dir(outdir)
-
-    # Mode 1: Stable Diffusion + adapter (LoRA)
-    if mode == 1:
-        logger.info("Running Mode 1: Stable Diffusion with adapter (img2img). Baseline: 1 image (no adapter) + 4 images (with adapter).")
-       
-        base_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
-        baseline = generate_and_save_images(
-            base_pipe,
-            refined_prompt,
-            [SEEDS[0]],
-            outdir,
-            basename=f"{class_name}_mode1_baseline",
-            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
-            denoising_strength=DEFAULT_DENOISING_STRENGTH,
-            negative_prompt=NEGATIVE_PROMPT,
-        )
-                    
-        append_run_log(
-            out_root=out_root,
-            mode=1,
-            object_category=class_name,
-            refined_prompt=refined_prompt,
-            prompt_used_for_generation=refined_prompt,
-            baseline_model=str(base_model),
-        )
-
-        # Adapter run: 4 images (with adapter) with the refined prompt
-        adapter_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
-        try:
-            adapter_pipe.load_lora_weights(str(adapter_filename))
-            logger.info(f"Loaded LoRA adapter from {adapter_filename}")
-        except Exception as e:
-            logger.error(f"Failed to load LoRA adapter {adapter_filename}: {e}")
-        
-        
-        generated = generate_and_save_images(
-            adapter_pipe,
-            refined_prompt,
-            SEEDS,
-            outdir,
-            basename=f"{class_name}_mode1",
-            init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
-            denoising_strength=DEFAULT_DENOISING_STRENGTH,
-            negative_prompt=NEGATIVE_PROMPT,
-        )
-        append_run_log(
-            out_root=out_root,
-            mode=1,
-            object_category=class_name,
-            refined_prompt=refined_prompt,
-            prompt_used_for_generation=refined_prompt,
-            baseline_model=str(base_model),
-        )
-
-        logger.info("Mode 1 completed.")
-
-        return baseline + generated
-
-    # Mode 2: ChatGPT image generation only (no SD/adapter)
-    elif mode == 2:
-        logger.info("Running Mode 2: ChatGPT image generation")
-        if not client:
-            logger.error("OpenAI client not configured (OPENAI_API_KEY missing). Cannot run mode 2.")
-            return []
-
-        # Compose tactile-design prompt
-        prompt = (
-            "Convert this natural image into a tactile graphic for individuals with visual impairments. "
-            "Follow tactile design principles (e.g., BANA). "
-            "Focus on raised, smooth lines to delineate key features. "
-            f"{refined_prompt}"
-        )
-        logger.info("Running Mode 2: ChatGPT image generation (image-to-image via edits)")
-        logger.info(f"Using ChatGPT image model: {OPENAI_IMAGE_MODEL}")
-
-        # Compatible sizes supported by the OpenAI image endpoint
-        SUPPORTED_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-        requested_size = f"{WIDTH}x{HEIGHT}"
-
-        # Map unsupported sizes to a sensible default: prefer same-aspect 1024x1024 for square requests,
-        # otherwise fall back to 'auto' which lets the model decide.
-        if requested_size in SUPPORTED_IMAGE_SIZES:
-            size_arg = requested_size
+        if class_name_override:
+            class_name = class_name_override
+            logger.info(f"Using provided class override: {class_name}")
         else:
-            if WIDTH == HEIGHT:
-                size_arg = "1024x1024"
-            else:
-                size_arg = "auto"
-            logger.info(f"Requested size {requested_size} not supported by API; using {size_arg} instead.")
+            detector = ClassDetectorCLIP(device=DEVICE)
+            class_name, sim = detector.detect_class(image_path, class_list)
+        if class_name is None:
+            logger.error("User class un-identified (below similarity threshold). Quitting.")
+            return
 
-        try:
-            # NOTE: do not pass `response_format` parameter (not supported by all clients).
-            src_png = ensure_png_for_openai(image_path, outdir)
-            resp = generate_image_via_openai_edit(
-                prompt=prompt,
-                size_arg=size_arg,
-                image_path=image_path,
-                tmp_dir=outdir,
-            )
+        mode2_designer = (mode == 2)
+        refined_prompt = refine_prompt_with_chatgpt(class_name, image_path, PROMPT_TEMPLATE, mode2_designer=mode2_designer)
+        logger.info(f"Refined prompt: {refined_prompt}")
 
-            # --- robustly extract returned image data ---
-            if isinstance(resp, dict):
-                item = resp["data"][0]
-            else:
-                item = resp.data[0]
+        # For modes that require an adapter (1 and 3), check adapter availability.
+        adapter_filename = adapters_dir / f"tactile_{class_name}.safetensors"
+        if mode in (1, 3) and not adapter_filename.exists():
+            logger.error(f"Adapter for class {class_name} not found at {adapter_filename}. Quitting.")
+            return
 
-            b64_image = None
-            img_url = None
-            if isinstance(item, dict):
-                b64_image = item.get("b64_json") or item.get("b64")
-                img_url = item.get("url")
-            else:
-                b64_image = getattr(item, "b64_json", None) or getattr(item, "b64", None)
-                img_url = getattr(item, "url", None)
+        outdir = out_root / f"{Path(image_path).stem}_{class_name}_mode{mode}"
+        ensure_dir(outdir)
 
-            if b64_image:
-                img_data = base64.b64decode(b64_image)
-                img = Image.open(BytesIO(img_data)).convert("RGB")
-            elif img_url:
-                import httpx
-                r = httpx.get(img_url, follow_redirects=True, timeout=30.0)
-                r.raise_for_status()
-                img = Image.open(BytesIO(r.content)).convert("RGB")
-            else:
-                raise RuntimeError("Image response did not contain 'b64_json' or 'url' fields. Response: " + str(resp))
-
-            # If we requested '1024x1024' but want to save at user WIDTHxHEIGHT, resize down (keeps quality)
-            if size_arg == "1024x1024" and (WIDTH != 1024 or HEIGHT != 1024):
-                logger.info(f"Resizing generated image from 1024x1024 to {WIDTH}x{HEIGHT} for consistency with pipeline settings.")
-                img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-
-            out_file = outdir / f"{class_name}_mode2_chatgpt.png"
-            img.save(out_file)
-            logger.info(f"Saved ChatGPT-generated tactile image to {out_file}")
-            logger.info(f"Mode 2 completed. Model used: ChatGPT image API")
-            logger.info(f"Prompt sent to ChatGPT: {prompt}")
-            append_run_log(
-                out_root=out_root,
-                mode=mode,
-                object_category=class_name,
-                refined_prompt=refined_prompt,
-                prompt_used_for_generation=prompt,
-                baseline_model=OPENAI_IMAGE_MODEL,
-            )
-            return [str(out_file)]
-
-        except Exception as e:
-            logger.error(f"ChatGPT image generation failed: {e}")
-            return []
-
-    # Mode 3: Apply adapter on multiple base models
-    elif mode == 3:
-        logger.info("Running Mode 3: Apply adapter on multiple base models")
-        all_results = {}
-        for model_id in base_models_for_mode3:
-            # Create a subdirectory for this model
-            model_safe_name = Path(model_id).stem
-            model_outdir = outdir / model_safe_name
-            ensure_dir(model_outdir)
-            
-            try:
-                base_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
-            except Exception as e:
-                logger.error(f"Failed to load base model {model_id}: {e}")
-                continue
-            
+        # Mode 1: Stable Diffusion + adapter (LoRA)
+        if mode == 1:
+            logger.info("Running Mode 1: Stable Diffusion with adapter (img2img). Baseline: 1 image (no adapter) + 4 images (with adapter).")
+        
+            base_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
             baseline = generate_and_save_images(
-                base_pipe, refined_prompt, [SEEDS[0]], model_outdir,
-                basename=f"{class_name}_{Path(model_id).name}_mode3_baseline",
-                init_image_path=image_path,
+                base_pipe,
+                refined_prompt,
+                [SEEDS[0]],
+                outdir,
+                basename=f"{class_name}_mode1_baseline",
+                init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
                 denoising_strength=DEFAULT_DENOISING_STRENGTH,
                 negative_prompt=NEGATIVE_PROMPT,
             )
-            
+                        
             append_run_log(
                 out_root=out_root,
-                mode=3,
+                mode=1,
                 object_category=class_name,
                 refined_prompt=refined_prompt,
                 prompt_used_for_generation=refined_prompt,
-                baseline_model=str(model_id),
+                baseline_model=str(base_model),
             )
-            
-            adapter_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
+
+            # Adapter run: 4 images (with adapter) with the refined prompt
+            adapter_pipe = load_sd_pipeline(base_model, device=DEVICE, img2img=USE_IMG2IMG_FOR_MODE1)
             try:
                 adapter_pipe.load_lora_weights(str(adapter_filename))
                 logger.info(f"Loaded LoRA adapter from {adapter_filename}")
             except Exception as e:
-                logger.warning(f"Failed to load LoRA adapter {adapter_filename} for {model_id}: {e}")
-                continue  # Skip this model if adapter loading fails
-
+                logger.error(f"Failed to load LoRA adapter {adapter_filename}: {e}")
+                return []
+            
             generated = generate_and_save_images(
-                adapter_pipe, refined_prompt, SEEDS, model_outdir,
-                basename=f"{class_name}_{Path(model_id).name}_mode3",
-                init_image_path=image_path,
+                adapter_pipe,
+                refined_prompt,
+                SEEDS,
+                outdir,
+                basename=f"{class_name}_mode1",
+                init_image_path=image_path if USE_IMG2IMG_FOR_MODE1 else None,
                 denoising_strength=DEFAULT_DENOISING_STRENGTH,
                 negative_prompt=NEGATIVE_PROMPT,
             )
             append_run_log(
                 out_root=out_root,
-                mode=3,
+                mode=1,
                 object_category=class_name,
                 refined_prompt=refined_prompt,
                 prompt_used_for_generation=refined_prompt,
-                baseline_model=str(model_id),
+                baseline_model=str(base_model),
             )
-            all_results[model_id] = {"baseline": baseline, "refined": generated}
-        return all_results
 
-    # Remove file handler to avoid duplicate logs in future runs
-    logger.removeHandler(file_handler)
-    file_handler.close()
+            logger.info("Mode 1 completed.")
+            return baseline + generated
+
+        # Mode 2: ChatGPT image generation only (no SD/adapter)
+        elif mode == 2:
+            logger.info("Running Mode 2: ChatGPT image generation")
+            if not client:
+                logger.error("OpenAI client not configured (OPENAI_API_KEY missing). Cannot run mode 2.")
+                return []
+
+            # Compose tactile-design prompt
+            prompt = (
+                "Convert this natural image into a tactile graphic for individuals with visual impairments. "
+                "Follow tactile design principles (e.g., BANA). "
+                "Focus on raised, smooth lines to delineate key features. "
+                f"{refined_prompt}"
+            )
+            logger.info("Running Mode 2: ChatGPT image generation (image-to-image via edits)")
+            logger.info(f"Using ChatGPT image model: {OPENAI_IMAGE_MODEL}")
+
+            # Compatible sizes supported by the OpenAI image endpoint
+            SUPPORTED_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+            requested_size = f"{WIDTH}x{HEIGHT}"
+
+            # Map unsupported sizes to a sensible default: prefer same-aspect 1024x1024 for square requests,
+            # otherwise fall back to 'auto' which lets the model decide.
+            if requested_size in SUPPORTED_IMAGE_SIZES:
+                size_arg = requested_size
+            else:
+                if WIDTH == HEIGHT:
+                    size_arg = "1024x1024"
+                else:
+                    size_arg = "auto"
+                logger.info(f"Requested size {requested_size} not supported by API; using {size_arg} instead.")
+
+            try:
+                # NOTE: do not pass `response_format` parameter (not supported by all clients).
+                src_png = ensure_png_for_openai(image_path, outdir)
+                resp = generate_image_via_openai_edit(
+                    prompt=prompt,
+                    size_arg=size_arg,
+                    image_path=image_path,
+                    tmp_dir=outdir,
+                )
+
+                # --- robustly extract returned image data ---
+                if isinstance(resp, dict):
+                    item = resp["data"][0]
+                else:
+                    item = resp.data[0]
+
+                b64_image = None
+                img_url = None
+                if isinstance(item, dict):
+                    b64_image = item.get("b64_json") or item.get("b64")
+                    img_url = item.get("url")
+                else:
+                    b64_image = getattr(item, "b64_json", None) or getattr(item, "b64", None)
+                    img_url = getattr(item, "url", None)
+
+                if b64_image:
+                    img_data = base64.b64decode(b64_image)
+                    img = Image.open(BytesIO(img_data)).convert("RGB")
+                elif img_url:
+                    import httpx
+                    r = httpx.get(img_url, follow_redirects=True, timeout=30.0)
+                    r.raise_for_status()
+                    img = Image.open(BytesIO(r.content)).convert("RGB")
+                else:
+                    raise RuntimeError("Image response did not contain 'b64_json' or 'url' fields. Response: " + str(resp))
+
+                # If we requested '1024x1024' but want to save at user WIDTHxHEIGHT, resize down (keeps quality)
+                if size_arg == "1024x1024" and (WIDTH != 1024 or HEIGHT != 1024):
+                    logger.info(f"Resizing generated image from 1024x1024 to {WIDTH}x{HEIGHT} for consistency with pipeline settings.")
+                    img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+                out_file = outdir / f"{class_name}_mode2_chatgpt.png"
+                img.save(out_file)
+                logger.info(f"Saved ChatGPT-generated tactile image to {out_file}")
+                logger.info(f"Mode 2 completed. Model used: ChatGPT image API")
+                logger.info(f"Prompt sent to ChatGPT: {prompt}")
+                append_run_log(
+                    out_root=out_root,
+                    mode=mode,
+                    object_category=class_name,
+                    refined_prompt=refined_prompt,
+                    prompt_used_for_generation=prompt,
+                    baseline_model=OPENAI_IMAGE_MODEL,
+                )
+                return [str(out_file)]
+
+            except Exception as e:
+                logger.error(f"ChatGPT image generation failed: {e}")
+                return []
+
+        # Mode 3: Apply adapter on multiple base models
+        elif mode == 3:
+            logger.info("Running Mode 3: Apply adapter on multiple base models")
+            all_results = {}
+            for model_id in base_models_for_mode3:
+                # Create a subdirectory for this model
+                model_safe_name = Path(model_id).stem
+                model_outdir = outdir / model_safe_name
+                ensure_dir(model_outdir)
+                
+                try:
+                    base_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
+                except Exception as e:
+                    logger.error(f"Failed to load base model {model_id}: {e}")
+                    continue
+                
+                baseline = generate_and_save_images(
+                    base_pipe, refined_prompt, [SEEDS[0]], model_outdir,
+                    basename=f"{class_name}_{Path(model_id).name}_mode3_baseline",
+                    init_image_path=image_path,
+                    denoising_strength=DEFAULT_DENOISING_STRENGTH,
+                    negative_prompt=NEGATIVE_PROMPT,
+                )
+                
+                append_run_log(
+                    out_root=out_root,
+                    mode=3,
+                    object_category=class_name,
+                    refined_prompt=refined_prompt,
+                    prompt_used_for_generation=refined_prompt,
+                    baseline_model=str(model_id),
+                )
+                
+                adapter_pipe = load_sd_pipeline(model_id, device=DEVICE, img2img=True)
+                try:
+                    adapter_pipe.load_lora_weights(str(adapter_filename))
+                    logger.info(f"Loaded LoRA adapter from {adapter_filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to load LoRA adapter {adapter_filename} for {model_id}: {e}")
+                    continue  # Skip this model if adapter loading fails
+
+                generated = generate_and_save_images(
+                    adapter_pipe, refined_prompt, SEEDS, model_outdir,
+                    basename=f"{class_name}_{Path(model_id).name}_mode3",
+                    init_image_path=image_path,
+                    denoising_strength=DEFAULT_DENOISING_STRENGTH,
+                    negative_prompt=NEGATIVE_PROMPT,
+                )
+                append_run_log(
+                    out_root=out_root,
+                    mode=3,
+                    object_category=class_name,
+                    refined_prompt=refined_prompt,
+                    prompt_used_for_generation=refined_prompt,
+                    baseline_model=str(model_id),
+                )
+                all_results[model_id] = {"baseline": baseline, "refined": generated}
+            return all_results
+
+    finally:
+        # Remove file handler to avoid duplicate logs in future runs
+        logger.removeHandler(file_handler)
+        file_handler.close()
+
     
     
 # ==========================
@@ -746,12 +764,41 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Tactile generation pipeline driver")
-    parser.add_argument("--image", required=True, help="Path to natural image")
+    parser.add_argument("--image", required=False, help="Path to natural image")
     parser.add_argument("--mode", type=int, default=1, choices=[1, 2, 3], help="Mode (1/2/3)")
     parser.add_argument("--adapters", default=str(ADAPTERS_DIR), help="Path to adapters directory")
     parser.add_argument("--base_model", default=DEFAULT_BASE_MODEL, help="Base SD model id (for mode 1/2)")
     parser.add_argument("--out", default="./outputs", help="Output directory")
+    parser.add_argument("--dataset_jsonl", help="Path to test_dataset.jsonl")
+    parser.add_argument("--dataset_base", default="", help="Optional base dir to prepend to relative input_image paths")
     args = parser.parse_args()
 
     ADAPTERS_DIR = Path(args.adapters)
-    run_pipeline(args.image, mode=args.mode, adapters_dir=ADAPTERS_DIR, base_model=args.base_model, out_root=Path(args.out))
+    
+    if args.dataset_jsonl:
+        entries = iter_dataset(Path(args.dataset_jsonl))
+        base_prefix = Path(args.dataset_base) if args.dataset_base else None
+        for category, img_rel in entries:
+            img_path = Path(img_rel)
+            if not img_path.is_absolute() and base_prefix:
+                img_path = base_prefix / img_rel
+            logger.info(f"Processing dataset entry: class={category}, image={img_path}")
+            run_pipeline(
+                str(img_path),
+                mode=args.mode,
+                adapters_dir=Path(args.adapters),
+                base_model=args.base_model,
+                out_root=Path(args.out),
+                class_name_override=category,
+            )
+    else:
+        if not args.image:
+            parser.error("Either --image or --dataset_jsonl must be provided.")
+        run_pipeline(
+            args.image,
+            mode=args.mode,
+            adapters_dir=Path(args.adapters),
+            base_model=args.base_model,
+            out_root=Path(args.out),
+        )
+
