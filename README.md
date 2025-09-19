@@ -1,7 +1,7 @@
 # TactileNet-v2 — Quick pipeline overview
 
-**Purpose (one line):**  
-TactileNet converts natural images into tactile-optimized graphics by combining automatic class detection (CLIP), ChatGPT prompt refinement (vision-capable model), and either Stable Diffusion (with LoRA adapters) or the OpenAI image API — useful for producing tactile designs for blind/low-vision users.
+**Purpose:**  
+TactileNet-v2 converts natural images into tactile-optimized graphics by combining automatic class detection (CLIP), ChatGPT prompt refinement (vision-capable model), and either Stable Diffusion (with LoRA adapters) or the OpenAI image API — useful for producing tactile designs for blind/low-vision users.
 
 ---
 
@@ -33,8 +33,7 @@ Adapters are expected in `./adapters` and must follow the naming pattern: `tacti
 ## Modes (1 / 2 / 3)
 
 ### Mode 1 — SD + LoRA adapter
-**Goal:** Produce a baseline SD img2img result and multiple adapter-enhanced variants for comparison.  
-**When to use:** Controlled experiments, local generation, reproducible baselines + adapter ablation.  
+**Goal:** Produce a baseline SD img2img result and multiple adapter-enhanced variants for comparison.   
 **Flow:**  
 - CLIP class detection → ChatGPT prompt refinement → load SD pipeline (img2img).  
 - Generate **1 baseline** image (no adapter).  
@@ -45,7 +44,6 @@ Adapters are expected in `./adapters` and must follow the naming pattern: `tacti
 
 ### Mode 2 — ChatGPT / OpenAI image edits
 **Goal:** Use the OpenAI image/edit API to directly convert the natural image to a tactile graphic (no SD/LoRA).  
-**When to use:** Fast prototyping or cloud-based single-model generation.  
 **Flow:**  
 - CLIP detection → concise vision-driven prompt (ChatGPT/OpenAI) → call `images.edits` (SDK or HTTP fallback) → save returned image.  
 **Output:** single image `..._mode2_chatgpt.png` and run log entry.
@@ -54,7 +52,6 @@ Adapters are expected in `./adapters` and must follow the naming pattern: `tacti
 
 ### Mode 3 — Multi-base comparison with adapter
 **Goal:** Apply the same class-specific adapter across multiple SD base models to evaluate robustness and differences.  
-**When to use:** Robustness testing, ablation across base models.  
 **Flow:**  
 - CLIP detection → ChatGPT refine → for each base model in `BASE_MODELS_FOR_MODE3`: generate 1 baseline, load adapter, generate N images (multiple seeds).  
 **Output:** `./outputs/<image_stem>_<class>_mode3/<base_model>/` (baseline + generated images + per-base logs).
