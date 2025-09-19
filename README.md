@@ -154,3 +154,80 @@ done
 - Or run batch jobs using dataset JSONL / folder loop scripts.  
 - Inspect `./outputs/` and `run_log.jsonl` for results and metadata.  
 
+## Evaluation (ChatGPT-based, context-aware)
+
+Purpose
+- Assess how well each generated tactile graphic communicates the essential content of its reference (natural) image, using a single, context-primed ChatGPT run grounded in BANA tactile graphics principles.
+
+Data artifacts
+- Context triplets (few-shot): `context_data/t1/<Category>/img.(png|jpg)` + expert feedback/rating (and optional `context_data/t2/<Category>/img.(png|jpg)` as the “after”).
+- Reference images: e.g., `test/<Category>/ref.png`.
+- Generated outputs: e.g., `outputs_mode1/...`, `outputs_mode2/ref_banana_mode2/banana_mode2_chatgpt.png`, `outputs_mode3/...`.
+
+Algorithm (high level)
+1. Pair discovery
+   - Recursively scan an outputs directory or a single generated image.
+   - Infer `Category` and `Mode` from path names like `ref_<class>_mode<mode>/...`.
+   - Resolve the corresponding reference via `ref_root + ref_pattern` (default `{class_name}/ref.png`).
+   - Construct an evaluation list of pairs: (id, category, mode, reference image, generated tactile image).
+2. Load few-shot context
+   - Read 50+ examples from `context_data/t1` (and optional `t2`), plus `feedback.csv` (Category, Expert Feedback, Rating).
+   - Each context item provides: Category, prior expert feedback/rating (e.g., “Missing landing gear”), t1 (before), and t2 (after) to demonstrate expected improvements.
+3. Image preprocessing (cost-aware)
+   - Resize all images to ≤ 640 px on the long side.
+   - Convert to compressed JPEG; embed via base64 data URLs to reduce tokens and bandwidth.
+4. Single-chat evaluation (batched)
+   - Build one messages payload:
+     - System prompt: defines the evaluator role, BANA-aligned criteria, allowed ratings, and strict JSON output format.
+     - Context block: concise text + images for each few-shot triplet (t1 + feedback/rating + optional t2).
+     - Evaluation block: for each pair, include item id, category, mode, reference (natural) image, and generated tactile image.
+     - Output constraint: “Return STRICT JSON array only, one entry per item.”
+   - Submit a single chat completion with a reasoning-capable, vision-enabled, cost-efficient model (default: gpt-4o-mini), temperature 0.0.
+5. Parse and normalize results
+   - Expect a JSON array of objects: `{id, rating, justification}`.
+   - Normalize `rating` to one of: “Accept as Is”, “Accept with Minor Edits”, “Accept with Major Edits”, “Reject”.
+   - Persist results to JSONL and CSV, joining metadata (category, mode, paths, timestamp).
+
+Prompt design (core templates)
+- System prompt (concise):
+  - “You are an expert tactile graphics evaluator familiar with BANA tactile graphics guidelines. Evaluate how well a generated tactile graphic conveys the essential structure and features of its reference image. Prioritize: clear raised outlines, simplified but accurate proportions, distinct textures separating parts, high figure–ground clarity, reduced clutter, preservation of class-defining features, and tactile readability. Allowed ratings: ‘Accept as Is’, ‘Accept with Minor Edits’, ‘Accept with Major Edits’, ‘Reject’. Output STRICT JSON only; for each item return: {id, rating, justification (one concise sentence grounded in tactile principles/BANA/expert patterns)}.”
+- Few-shot context block (per example):
+  - Text: “Category: <Category>; Expert Feedback: <feedback or N/A>; Given Rating: <rating or N/A>; Before (t1):” + image(t1) [+ “After (t2):” + image(t2) if available].
+- Evaluation block (per item):
+  - Text: “Item id: <id>; Category: <category>; Mode: <mode>; Reference (natural) image:” + image(ref)
+  - Text: “Generated tactile graphic:” + image(gen)
+  - Final instruction: “Return STRICT JSON array only, no prose.”
+
+Evaluation criteria (BANA-aligned, operationalized)
+- Class-defining features are retained and unambiguous (e.g., airplane landing gear, animal ear shape, bicycle spokes vs. frame).
+- Clear raised outlines for primary forms; simplified internal details that aid touch recognition.
+- Distinct textures/line styles for different parts or materials; consistent coding.
+- Accurate, simplified proportions; avoidance of visual clutter and overlapping confusion.
+- Strong figure–ground separation; minimal distracting background.
+- High-contrast partitioning (for mixed-ability use) without relying on shading that does not translate to tactile.
+- Orientation, scale, and spatial relations that reduce ambiguity (e.g., limb crossings, occlusions).
+- Proper omission/abstraction of non-essential details; no decorative noise that harms tactile legibility.
+
+Flow (inputs-to-outputs perspective)
+- Inputs:
+  - Context: `context_data/t1`, optional `context_data/t2`, and `feedback.csv` mapping Category → Expert Feedback/Rating.
+  - Pairs to evaluate: discovered automatically from outputs directories (by class/mode patterns) and matched to references via `ref_root + ref_pattern`.
+  - Model: vision-capable mini-series reasoning model (default: gpt-4o-mini), temperature 0.0.
+- Processing:
+  - Preprocess images (resize/compress), assemble one chat with context + all evaluation pairs, request strict JSON output, parse/normalize ratings.
+- ***Outputs***
+  - `eval_results.jsonl` — one record per item:
+    - `{id, category, mode, generated_image, ref_image, rating, justification, model, timestamp}`
+  - `eval_results.csv` — same fields in tabular form for dashboards/metrics.
+
+Cost and robustness strategies
+- Single-call batching (context set once, all pairs evaluated together).
+- Image downscaling and JPEG compression to reduce tokens.
+- Optional context limiting (e.g., top-N examples) to fit budget while preserving class diversity.
+- Deterministic pair IDs: `"<class>::<mode>::<file_stem>"` for stable traceability.
+- Rating normalization and strict JSON parsing with conservative fallbacks if IDs mismatch.
+
+Known limitations and next steps
+- Extremely large batches may exceed context limits; chunking into multiple calls with shared context is the natural extension.
+- Context quality governs evaluation sharpness; periodically refresh few-shot examples and expand coverage of edge cases.
+- Consider light-weight rubric scoring (sub-scores for outline, texture coding, figure–ground) alongside the categorical rating for richer analytics.
